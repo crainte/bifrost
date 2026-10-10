@@ -1,0 +1,36 @@
+amends "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.5.0/hk@2.5.0#/Builtins.pkl"
+
+// Shared steps run on pre-commit (with fixes staged), `hk check` and `hk fix`.
+// Custom cargo steps instead of the builtins: the crate lives in rust/, and
+// the rustfmt builtin hardcodes --edition 2024 while this crate is 2021.
+steps {
+  ["cargo-fmt"] {
+    glob = "rust/**/*.rs"
+    check = "cargo fmt --manifest-path rust/Cargo.toml --check"
+    fix = "cargo fmt --manifest-path rust/Cargo.toml"
+  }
+  ["clippy"] {
+    glob = "rust/**/*.rs"
+    check = "cargo clippy --manifest-path rust/Cargo.toml --all-targets --locked --quiet -- -D warnings"
+  }
+  ["actionlint"] = Builtins.actionlint
+}
+
+hooks {
+  ["pre-push"] {
+    steps {
+      ["cargo-test"] {
+        glob = "rust/**"
+        check = "cargo test --manifest-path rust/Cargo.toml --locked --quiet"
+      }
+      // No local Erlang toolchain is assumed: EUnit runs in the same image CI
+      // uses. Build output goes to a named volume so the container never
+      // writes root-owned files into the working tree.
+      ["eunit"] {
+        glob = "erlang/**"
+        check = "docker run --rm -v \"$PWD/erlang:/src:ro\" -v bifrost-hk-rebar:/cache -e REBAR_BASE_DIR=/cache/_build -e REBAR_CACHE_DIR=/cache/rebar3 -w /src erlang:26 rebar3 eunit"
+      }
+    }
+  }
+}

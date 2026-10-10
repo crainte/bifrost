@@ -1,0 +1,24 @@
+# Apply order matters: namespace first, then config/secret, then workload.
+# Usage:  kubectl apply -k k8s/
+#
+# Prereqs (not managed here):
+#   - An external PostgreSQL reachable at the host in configmap.yaml, with the
+#     schema owner able to run migrations (auto-applied on boot).
+#   - Reloader (Stakater) installed cluster-wide to honor the reload annotations.
+#   - The `bifrost-secrets` Secret, created OUT OF BAND (sealed-secrets, SOPS,
+#     external-secrets, or `kubectl create secret`). secret.yaml is a TEMPLATE
+#     and is deliberately NOT listed below: applying it would deploy its
+#     placeholder values. Bifrost refuses placeholder/short session secrets and
+#     cluster cookies at startup, but don't rely on that as your process.
+#   - Set the StatefulSet image to your registry ref + digest.
+#   - A NetworkPolicy-enforcing CNI (Calico, Cilium, ...) for networkpolicy.yaml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: bifrost
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - service.yaml
+  - statefulset.yaml
+  - networkpolicy.yaml
+  - pdb.yaml

@@ -1,0 +1,89 @@
+# 3-node cluster for production-scaling validation. Shared Postgres, distributed
+# Erlang over short names (unique resolvable hostnames), Mnesia auto-join via
+# BIFROST_CLUSTER_NODES. Run:
+#   docker compose -f docker-compose.yml -f docker-compose.cluster.yml up -d --build
+# The base `bifrost` service is overridden into three named replicas.
+services:
+  bifrost:
+    deploy:
+      replicas: 0        # disable the single-node service; use the three below
+
+  bifrost-1:
+    build:
+      context: .
+      dockerfile: erlang/Dockerfile
+    hostname: bifrost-1
+    ports:
+      - "0.0.0.0:8081:8081"
+      - "0.0.0.0:1053:5454/udp"
+      - "0.0.0.0:1053:5454/tcp"
+    volumes:
+      - ./dev/config.yaml:/etc/bifrost/config.yaml:ro
+    environment:
+      BIFROST_CONFIG_PATH: /etc/bifrost/config.yaml
+      BIFROST_RUST_BIN: /usr/local/bin/bifrost-resolver
+      BIFROST_LISTEN_ADDR: 0.0.0.0:5454
+      RUST_LOG: bifrost_resolver::listener=debug
+      BIFROST_CLUSTER_NODES: "bifrost@bifrost-1,bifrost@bifrost-2,bifrost@bifrost-3"
+      BIFROST_SESSION_SECRET: "dev-session-secret-0123456789abcdef"
+      # dev only: clustered nodes refuse a placeholder/short cookie (>= 32 bytes)
+      BIFROST_COOKIE: "dev-cluster-cookie-0123456789abcdef0123"
+      BIFROST_ADMIN_USER: "admin"
+      # dev only: PBKDF2 hash of "hunter2"
+      BIFROST_ADMIN_PASSWORD_HASH: "pbkdf2$$sha256$$210000$$ARfW2SitZeF98H7ApEay5g==$$YDL9BgwOZTB7krysbiR4qaflaHZY0LHj4E2iFs2rIU4="
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bifrost-2:
+    build:
+      context: .
+      dockerfile: erlang/Dockerfile
+    hostname: bifrost-2
+    ports:
+      - "0.0.0.0:8092:8081"
+    volumes:
+      - ./dev/config.yaml:/etc/bifrost/config.yaml:ro
+    environment:
+      BIFROST_CONFIG_PATH: /etc/bifrost/config.yaml
+      BIFROST_RUST_BIN: /usr/local/bin/bifrost-resolver
+      BIFROST_LISTEN_ADDR: 0.0.0.0:5454
+      RUST_LOG: bifrost_resolver::listener=debug
+      BIFROST_CLUSTER_NODES: "bifrost@bifrost-1,bifrost@bifrost-2,bifrost@bifrost-3"
+      BIFROST_SESSION_SECRET: "dev-session-secret-0123456789abcdef"
+      # dev only: clustered nodes refuse a placeholder/short cookie (>= 32 bytes)
+      BIFROST_COOKIE: "dev-cluster-cookie-0123456789abcdef0123"
+      BIFROST_ADMIN_USER: "admin"
+      # dev only: PBKDF2 hash of "hunter2"
+      BIFROST_ADMIN_PASSWORD_HASH: "pbkdf2$$sha256$$210000$$ARfW2SitZeF98H7ApEay5g==$$YDL9BgwOZTB7krysbiR4qaflaHZY0LHj4E2iFs2rIU4="
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bifrost-3:
+    build:
+      context: .
+      dockerfile: erlang/Dockerfile
+    hostname: bifrost-3
+    ports:
+      - "0.0.0.0:8093:8081"
+    volumes:
+      - ./dev/config.yaml:/etc/bifrost/config.yaml:ro
+    environment:
+      BIFROST_CONFIG_PATH: /etc/bifrost/config.yaml
+      BIFROST_RUST_BIN: /usr/local/bin/bifrost-resolver
+      BIFROST_LISTEN_ADDR: 0.0.0.0:5454
+      RUST_LOG: bifrost_resolver::listener=debug
+      BIFROST_CLUSTER_NODES: "bifrost@bifrost-1,bifrost@bifrost-2,bifrost@bifrost-3"
+      BIFROST_SESSION_SECRET: "dev-session-secret-0123456789abcdef"
+      # dev only: clustered nodes refuse a placeholder/short cookie (>= 32 bytes)
+      BIFROST_COOKIE: "dev-cluster-cookie-0123456789abcdef0123"
+      BIFROST_ADMIN_USER: "admin"
+      # dev only: PBKDF2 hash of "hunter2"
+      BIFROST_ADMIN_PASSWORD_HASH: "pbkdf2$$sha256$$210000$$ARfW2SitZeF98H7ApEay5g==$$YDL9BgwOZTB7krysbiR4qaflaHZY0LHj4E2iFs2rIU4="
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped

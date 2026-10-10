@@ -1,0 +1,4 @@
+[tools]
+hk = "2.5.0"
+git-cliff = "latest"
+actionlint = "1.7.12"

@@ -1,0 +1,221 @@
+<div class="st-main">
+  <dl class="st-stats" aria-label="Client summary">
+    <div class="st-stat accent"><dt>Clients · 90 days</dt><dd id="cs-count">—</dd></div>
+    <div class="st-stat"><dt>Named</dt><dd id="cs-named">—</dd></div>
+    <div class="st-stat"><dt>Most active · 90 days</dt><dd id="cs-top" style="font-size:16px">—</dd></div>
+    <div class="st-stat warn"><dt>Highest block rate</dt><dd id="cs-rate" style="font-size:16px">—</dd></div>
+  </dl>
+
+  <section class="st-section" aria-labelledby="cl-title">
+    <header class="st-section__head">
+      <div><h2 id="cl-title">Network clients</h2><p>Devices that queried Bifrost in the last 90 days, the same window as the Overview. Name a device to recognise it everywhere, or expand it to review suspicious lookups and per-device rules.</p></div>
+    </header>
+    <div class="st-toolbar">
+      <input type="search" id="cl-search" class="form-field" placeholder="Filter by name or IP…" aria-label="Filter clients" autocomplete="off">
+      <label class="st-inline">Sort
+        <select id="cl-sort" class="form-field" style="min-width:170px;flex:0 0 auto">
+          <option value="total">Most queries</option><option value="rate">Highest block rate</option><option value="seen">Recently seen</option><option value="name">Name</option>
+        </select></label>
+    </div>
+    <div class="table-wrap"><table class="data-table q-table">
+      <thead><tr><th>Client</th><th style="width:110px;text-align:right">Queries · 90d</th><th style="width:110px;text-align:right">Blocked</th><th style="width:210px">Block rate</th><th style="width:130px">Last seen</th><th style="width:60px"><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody id="cl-rows"><tr><td colspan="6" class="q-empty">Loading…</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <div id="cl-status" class="st-savebar st-hidden" role="status" aria-live="polite"><div class="st-savebar__status" id="cl-status-text"></div></div>
+</div>
+
+<script>
+(function () {
+  var rows = document.getElementById('cl-rows'), clients = [], blocks = {}, openIp = null, editingIp = null, toastTimer;
+  var requestedIp = new URLSearchParams(location.search).get('ip');
+  function $(id) { return document.getElementById(id); }
+  function make(tag, cls, v) { var e = document.createElement(tag); if (cls) e.className = cls; if (v != null) e.textContent = String(v); return e; }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function icon(name, cls) { var ns = 'http://www.w3.org/2000/svg', s = document.createElementNS(ns, 'svg'), u = document.createElementNS(ns, 'use'); s.setAttribute('class', 'ic ' + (cls || '')); s.setAttribute('aria-hidden', 'true'); u.setAttribute('href', '#i-' + name); s.appendChild(u); return s; }
+  function toast(msg, kind) {
+    var bar = $('cl-status'); $('cl-status-text').textContent = msg; bar.className = 'st-savebar ' + (kind || '');
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { bar.classList.add('st-hidden'); }, kind === 'error' ? 6000 : 3000);
+  }
+  function send(method, url, body) {
+    return fetch(url, {method: method, headers: {'Content-Type': 'application/json'}, body: body ? JSON.stringify(body) : undefined})
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json().catch(function () { return {}; }); });
+  }
+  function rate(c) { return c.total ? c.blocked / c.total * 100 : 0; }
+  function label(c) { return c.name || c.ip; }
+  function ago(iso) {
+    var t = Date.parse(iso); if (isNaN(t)) return '—';
+    var s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 60) return 'just now'; if (s < 3600) return Math.round(s / 60) + 'm ago';
+    if (s < 86400) return Math.round(s / 3600) + 'h ago'; return Math.round(s / 86400) + 'd ago';
+  }
+
+  function renderStats() {
+    $('cs-count').textContent = clients.length;
+    $('cs-named').textContent = clients.filter(function (c) { return c.name_source === 'label'; }).length;
+    var top = clients.slice().sort(function (a, b) { return b.total - a.total; })[0];
+    $('cs-top').textContent = top ? label(top) : '—';
+    var busy = clients.filter(function (c) { return c.total >= 20; }).sort(function (a, b) { return rate(b) - rate(a); })[0];
+    $('cs-rate').textContent = busy ? label(busy) + ' · ' + rate(busy).toFixed(1) + '%' : '—';
+  }
+
+  function visible() {
+    var q = $('cl-search').value.trim().toLowerCase(), sort = $('cl-sort').value;
+    var key = {total: function (c) { return -c.total; }, rate: function (c) { return -rate(c); },
+               seen: function (c) { return -(Date.parse(c.last_seen) || 0); }, name: function () { return 0; }}[sort];
+    return clients.filter(function (c) { return !q || (c.ip + ' ' + (c.name || '')).toLowerCase().indexOf(q) !== -1; })
+      .sort(function (a, b) { return sort === 'name' ? label(a).localeCompare(label(b)) : key(a) - key(b); });
+  }
+
+  function nameCell(c) {
+    var td = make('td'), wrap = make('div'); wrap.style.cssText = 'display:flex;align-items:center;gap:10px';
+    var chev = icon('chevron', 'ql-chev'); wrap.appendChild(chev);
+    if (editingIp === c.ip) {
+      var form = make('form', 'c-edit'), input = make('input', 'form-field'), save = make('button', 'btn btn-primary btn-sm', 'Save'), cancel = make('button', 'btn btn-ghost btn-sm', 'Cancel');
+      input.value = c.label || ''; input.placeholder = 'Name for ' + c.ip; input.maxLength = 64; input.setAttribute('aria-label', 'Name for ' + c.ip);
+      cancel.type = 'button'; cancel.onclick = function (e) { e.stopPropagation(); editingIp = null; render(); };
+      form.onclick = function (e) { e.stopPropagation(); };
+      form.onsubmit = function (e) {
+        e.preventDefault(); save.disabled = true;
+        send('POST', '/api/clients/' + encodeURIComponent(c.ip), {name: input.value.trim()})
+          .then(function () { toast(input.value.trim() ? 'Saved name for ' + c.ip + '.' : 'Name cleared for ' + c.ip + '.'); editingIp = null; load(); })
+          .catch(function () { save.disabled = false; toast('Could not save the name.', 'error'); });
+      };
+      input.onkeydown = function (e) { if (e.key === 'Escape') { editingIp = null; render(); } };
+      form.append(input, save, cancel); wrap.appendChild(form); td.appendChild(wrap);
+      setTimeout(function () { input.focus(); input.select(); }, 0);
+      return td;
+    }
+    var n = make('div', 'c-name');
+    if (c.name) {
+      var strong = make('strong', c.name_source === 'ptr' ? 'auto' : null, c.name);
+      if (c.name_source === 'ptr') { var a = make('span', 'c-auto', 'auto'); a.title = 'Name from reverse DNS'; strong.appendChild(a); }
+      n.append(strong, make('span', 'mono', c.ip));
+    } else n.appendChild(make('strong', 'c-ip', c.ip));
+    wrap.appendChild(n); td.appendChild(wrap); return td;
+  }
+
+  function render() {
+    clear(rows);
+    var list = visible();
+    if (!list.length) { var tr = make('tr'), td = make('td', 'q-empty', clients.length ? 'No clients match this filter.' : 'No clients in the last 90 days.'); td.colSpan = 6; tr.appendChild(td); rows.appendChild(tr); return; }
+    list.forEach(function (c) {
+      var tr = make('tr', 'ql-row' + (openIp === c.ip ? ' open' : '')); tr.tabIndex = 0; tr.dataset.ip = c.ip;
+      tr.setAttribute('aria-expanded', String(openIp === c.ip));
+      var r = rate(c);
+      var total = make('td', null, Number(c.total || 0).toLocaleString()); total.style.textAlign = 'right';
+      var blocked = make('td', 'tone-danger', Number(c.blocked || 0).toLocaleString()); blocked.style.textAlign = 'right';
+      var rc = make('td'), bar = make('div', 'c-rate'), track = make('div', 'rate-track'), fill = make('span', 'rate-fill');
+      fill.style.width = r.toFixed(1) + '%'; track.appendChild(fill); bar.append(track, make('span', null, r.toFixed(1) + '%')); rc.appendChild(bar);
+      var seen = make('td', 'ql-time', ago(c.last_seen)); if (c.last_seen) seen.title = new Date(c.last_seen).toLocaleString();
+      var act = make('td'); act.style.textAlign = 'right';
+      var edit = make('button', 'ql-icon-btn'); edit.type = 'button'; edit.title = 'Rename'; edit.setAttribute('aria-label', 'Rename ' + c.ip); edit.appendChild(icon('edit', 'ic-sm'));
+      edit.onclick = function (e) { e.stopPropagation(); editingIp = c.ip; render(); };
+      act.appendChild(edit);
+      tr.append(nameCell(c), total, blocked, rc, seen, act);
+      tr.onclick = function () { if (editingIp !== c.ip) toggle(c.ip); };
+      tr.onkeydown = function (e) { if (e.target === tr && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggle(c.ip); } };
+      rows.appendChild(tr);
+      if (openIp === c.ip) rows.appendChild(panel(c));
+    });
+  }
+
+  function toggle(ip) { openIp = openIp === ip ? null : ip; render(); }
+
+  function panel(c) {
+    var tr = make('tr', 'ql-detail'), td = make('td'); td.colSpan = 6;
+    var grid = make('div', 'c-panel');
+    var sus = make('div', 'c-card'), sh = make('div', 'c-card__head'), sb = make('div', 'c-card__body');
+    var enrich = make('label', 'st-inline'), cb = make('input', 'st-check'); cb.type = 'checkbox'; cb.checked = !!c._enrich;
+    enrich.append(cb, document.createTextNode(' Look up registration (RDAP)'));
+    sh.append(make('h4', null, 'Suspicious lookups · last 24 hours'), enrich);
+    sus.append(sh, sb); scan(c, sb);
+    cb.onchange = function () { c._enrich = cb.checked; scan(c, sb); };
+
+    var rules = make('div', 'c-card'), rh = make('div', 'c-card__head'), rb = make('div', 'c-card__body');
+    rh.appendChild(make('h4', null, 'Rules for this device'));
+    var mine = blocks[c.ip] || [];
+    if (!mine.length) rb.appendChild(make('div', 'c-line', 'No device-specific blocks.'));
+    mine.forEach(function (d) {
+      var line = make('div', 'c-line'); line.style.alignItems = 'center';
+      var ic = icon('ban', 'ic-sm r-ic-block'), name = make('span', 'mono grow', d), rm = make('button', 'ql-icon-btn'); rm.style.opacity = 1;
+      rm.type = 'button'; rm.title = 'Remove'; rm.setAttribute('aria-label', 'Remove block for ' + d); rm.appendChild(icon('trash', 'ic-sm'));
+      rm.onclick = function () {
+        send('DELETE', '/api/client-blocks', {client_ip: c.ip, domain: d}).then(function () { toast('Removed ' + d + ' for ' + label(c) + '.'); loadBlocks(); })
+          .catch(function () { toast('Could not remove the rule.', 'error'); });
+      };
+      line.append(ic, name, rm); rb.appendChild(line);
+    });
+    var add = make('form', 'c-quick'), input = make('input', 'form-field'), btn = make('button', 'btn btn-secondary btn-sm', 'Block for this device');
+    input.placeholder = 'domain.example'; input.required = true; input.style.flex = '1'; input.setAttribute('aria-label', 'Domain to block for ' + c.ip);
+    add.onsubmit = function (e) {
+      e.preventDefault(); var d = input.value.trim(); if (!d) return;
+      send('POST', '/api/client-blocks', {client_ip: c.ip, domain: d}).then(function () { toast(d + ' blocked for ' + label(c) + '.'); loadBlocks(); })
+        .catch(function () { toast('Could not add the rule. Check the domain.', 'error'); });
+    };
+    add.append(input, btn);
+    var links = make('div', 'c-quick');
+    [['All queries', '/query-log?search=' + encodeURIComponent(c.ip)], ['Blocked queries', '/query-log?search=' + encodeURIComponent(c.ip) + '&action=BIFROST_BLOCK']].forEach(function (l) {
+      var a = make('a', 'btn btn-ghost btn-sm', l[0]); a.href = l[1]; links.appendChild(a);
+    });
+    rules.append(rh, rb, add, links);
+    grid.append(sus, rules); td.appendChild(grid); tr.appendChild(td);
+    return tr;
+  }
+
+  function scan(c, body) {
+    clear(body); body.appendChild(make('div', 'c-line', 'Scanning…'));
+    var key = c._enrich ? 'rdap' : 'plain';
+    c._scans = c._scans || {};
+    c._scans[key] = c._scans[key] || fetch('/api/clients/' + encodeURIComponent(c.ip) + '/suspicious?hours=24&limit=25' + (c._enrich ? '&enrich=true' : ''))
+      .then(function (r) { if (!r.ok) throw new Error(); return r.json(); })
+      .catch(function (e) { delete c._scans[key]; throw e; });
+    c._scans[key]
+      .then(function (d) {
+        clear(body);
+        var list = (d && d.suspicious) || [];
+        if (!list.length) { body.appendChild(make('div', 'c-line', 'Nothing suspicious in the last 24 hours.')); return; }
+        list.forEach(function (s) {
+          var line = make('div', 'c-line'), score = make('span', 'sev ' + (s.score >= 9 ? 'sev-high' : s.score >= 6 ? 'sev-mid' : 'sev-low'), s.score || 0);
+          var grow = make('div', 'grow'), top = make('div');
+          top.append(make('span', 'mono', s.domain), make('small', null, '  ' + (s.hits || 0) + ' hits' + (s.rdap && s.rdap.age_days != null ? ' · ' + s.rdap.age_days + 'd old' : '')));
+          var tags = make('div', 't-tags'); tags.style.marginTop = '5px';
+          (s.reasons || []).forEach(function (r) { var rd = r.indexOf('rdap:') === 0, t = make('span', rd ? 'tag tag-rdap' : 'tag', (rd ? r.slice(5) : r).replace(/_/g, ' ')); if (rd) t.title = 'From RDAP registry data'; tags.appendChild(t); });
+          grow.append(top, tags); line.append(score, grow); body.appendChild(line);
+        });
+      })
+      .catch(function () { clear(body); body.appendChild(make('div', 'c-line error-state', 'Scan failed. Try again.')); });
+  }
+
+  function loadBlocks() {
+    return fetch('/api/client-blocks').then(function (r) { return r.ok ? r.json() : {blocks: []}; }).then(function (d) {
+      blocks = {}; (d.blocks || []).forEach(function (b) { (blocks[b.client_ip] = blocks[b.client_ip] || []).push(b.domain); });
+      render();
+    }).catch(function () {});
+  }
+  function load() {
+    return fetch('/api/clients').then(function (r) { if (!r.ok) throw new Error(); return r.json(); }).then(function (d) {
+      var prev = {}; clients.forEach(function (c) { prev[c.ip] = c; });
+      clients = ((d && d.clients) || []).map(function (c) { var p = prev[c.ip]; if (p) { c._scans = p._scans; c._enrich = p._enrich; } return c; });
+      if (requestedIp && !clients.some(function (c) { return c.ip === requestedIp; })) {
+        return fetch('/api/clients?ip=' + encodeURIComponent(requestedIp)).then(function (r) { return r.json(); })
+          .then(function (x) { clients = clients.concat((x && x.clients) || []); });
+      }
+    }).then(function () {
+      renderStats();
+      if (requestedIp) {
+        if (clients.some(function (c) { return c.ip === requestedIp; })) openIp = requestedIp;
+        else toast('No queries from ' + requestedIp + ' in the last 90 days.', 'error');
+        requestedIp = null;
+      }
+      render();
+      var row = openIp && rows.querySelector('tr[data-ip="' + CSS.escape(openIp) + '"]');
+      if (row) row.scrollIntoView({block: 'center'});
+    }).catch(function () { clear(rows); var tr = make('tr'), td = make('td', 'q-empty error-state', 'Could not load clients. Reload to retry.'); td.colSpan = 6; tr.appendChild(td); rows.appendChild(tr); });
+  }
+  $('cl-search').addEventListener('input', render);
+  $('cl-sort').addEventListener('change', render);
+  load().then(loadBlocks);
+})();
+</script>

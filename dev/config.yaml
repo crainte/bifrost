@@ -1,0 +1,14 @@
+{upstreams, [[{address, "192.0.2.10"}, {port, 53}], [{address, "192.0.2.11"}, {port, 53}]]}.
+{cache, [{max_ttl, 3600}, {min_ttl, 60}, {max_entries, 100000}]}.
+{blocklists, {default, [
+    [{name, "hagezi-pro"}, {url, "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.txt"}, {enabled, true}],
+    [{name, "oisd-big"}, {url, "https://big.oisd.nl/domainswild"}, {enabled, true}],
+    [{name, "jarelllama-scam"}, {url, "https://raw.githubusercontent.com/jarelllama/Scam-Blocklist/main/lists/adblock/scams.txt"}, {enabled, true}]
+]}}.
+{network, [{listen_address, "0.0.0.0"}, {listen_port, 5454}, {unix_socket_path, "/run/bifrost/ipc.sock"}]}.
+%% Optional reverse-DNS (PTR) resolver for friendly client names. RFC1918 PTR
+%% only resolves against the LAN authority (gateway/router), not public
+%% upstreams. Set to the gateway IP to enable; leave unset to skip PTR entirely.
+{ptr_resolver, "192.0.2.1"}.
+{blocking, [{mode, zero_ip}, {custom_ip, ""}]}.
+{database, [{host, "postgres"}, {port, 5432}, {name, "bifrost"}, {user, "bifrost"}, {password, "bifrost"}]}.

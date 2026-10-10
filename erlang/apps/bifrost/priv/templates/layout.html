@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{title}} — Bifrost DNS</title>
+<link rel="icon" type="image/png" href="/static/bifrost-icon.png">
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/static/bifrost.css">
+<script>try{if(localStorage.getItem('bifrost.sidebar')==='collapsed')document.documentElement.classList.add('sidebar-collapsed')}catch(e){}</script>
+<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<div class="app-shell">
+  <!-- Icons: hand-inlined, adapted from Feather/Lucide (MIT/ISC). No icon font or CDN needed. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></symbol>
+    <symbol id="i-queries" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-clients" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+    <symbol id="i-threats" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></symbol>
+    <symbol id="i-blocklists" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></symbol>
+    <symbol id="i-rules" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+    <symbol id="i-collapse" viewBox="0 0 24 24"><path d="m11 17-5-5 5-5M18 17l-5-5 5-5"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/></symbol>
+    <symbol id="i-allow" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-rewrite" viewBox="0 0 24 24"><path d="m15 10 5 5-5 5"/><path d="M4 4v7a4 4 0 0 0 4 4h12"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="7" r="4"/><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  </svg>
+  <nav class="sidebar" id="app-sidebar" aria-label="Primary navigation">
+    <a href="/dashboard" class="brand" aria-label="Bifrost overview"><img class="brand-wordmark" src="/static/bifrost-wordmark.png" alt="Bifrost DNS" draggable="false"><img class="brand-icon" src="/static/bifrost-icon.png" alt="" draggable="false"></a>
+    <div class="nav-group"><div class="nav-label">Monitor</div>
+      <a href="/dashboard" class="nav-link" data-nav data-tip="Overview"><svg class="ic" aria-hidden="true"><use href="#i-overview"/></svg><span class="nav-text">Overview</span></a>
+      <a href="/query-log" class="nav-link" data-nav data-tip="Queries"><svg class="ic" aria-hidden="true"><use href="#i-queries"/></svg><span class="nav-text">Queries</span></a>
+      <a href="/clients" class="nav-link" data-nav data-tip="Clients"><svg class="ic" aria-hidden="true"><use href="#i-clients"/></svg><span class="nav-text">Clients</span></a>
+    </div>
+    <div class="nav-group"><div class="nav-label">Review</div>
+      <a href="/threats" class="nav-link" data-nav data-tip="Threats"><svg class="ic" aria-hidden="true"><use href="#i-threats"/></svg><span class="nav-text">Threats</span></a>
+    </div>
+    <div class="nav-group"><div class="nav-label">Configure</div>
+      <a href="/blocklists" class="nav-link" data-nav data-tip="Blocklists"><svg class="ic" aria-hidden="true"><use href="#i-blocklists"/></svg><span class="nav-text">Blocklists</span></a>
+      <a href="/filters" class="nav-link" data-nav data-tip="Rules"><svg class="ic" aria-hidden="true"><use href="#i-rules"/></svg><span class="nav-text">Rules</span></a>
+      <a href="/settings" class="nav-link" data-nav data-tip="Settings"><svg class="ic" aria-hidden="true"><use href="#i-settings"/></svg><span class="nav-text">Settings</span></a>
+    </div>
+    <div class="signout-wrap">
+      <button type="button" id="sidebar-collapse" class="nav-link collapse-btn" data-tip="Expand sidebar" aria-pressed="false"><svg class="ic" aria-hidden="true"><use href="#i-collapse"/></svg><span class="nav-text">Collapse</span></button>
+      <form method="post" action="/logout"><button type="submit" class="signout" data-tip="Sign out"><svg class="ic" aria-hidden="true"><use href="#i-logout"/></svg><span class="nav-text">Sign out</span></button></form>
+    </div>
+  </nav>
+  <main class="app-main" id="main-content">
+    <header class="app-header">
+      <div><button class="sidebar-toggle btn btn-secondary" type="button" aria-controls="app-sidebar" aria-expanded="false">Menu</button><h1 class="page-title">{{heading}}</h1><p class="page-subtitle">{{subtitle}}</p></div>
+      <div class="protection-wrap"><button type="button" id="protection-status" class="protection-status" aria-expanded="false" aria-controls="protection-menu"><span class="status-dot"></span>Loading protection…</button></div>
+    </header>
+    <div class="page-content">{{content|raw}}</div>
+  </main>
+</div>
+<script>
+(function(){
+  var p = location.pathname;
+  document.querySelectorAll('[data-nav]').forEach(function(a) {
+    if (a.getAttribute('href') === p) {
+      a.classList.remove('text-slate-400', 'border-transparent');
+      a.classList.add('active');
+      a.setAttribute('aria-current', 'page');
+    }
+  });
+
+
+  function positionTooltip(trigger, tooltip) {
+    var rect = trigger.getBoundingClientRect();
+    var left = rect.right + 8;
+    var top = rect.top;
+
+    tooltip.style.visibility = 'hidden';
+    tooltip.classList.add('visible');
+    var ttRect = tooltip.getBoundingClientRect();
+    tooltip.classList.remove('visible');
+    tooltip.style.visibility = '';
+
+    if (top + ttRect.height > window.innerHeight) {
+      top = rect.bottom - ttRect.height;
+    }
+
+    if (top < 0) top = 0;
+    if (left + ttRect.width > window.innerWidth) left = window.innerWidth - ttRect.width - 8;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+
+  document.addEventListener('mouseenter', function(e) {
+    var trigger = e.target instanceof Element ? e.target.closest('.info-trigger') : null;
+    if (!trigger) return;
+    var tooltip = trigger.querySelector('.info-tooltip');
+    if (tooltip && !tooltip.classList.contains('pinned')) {
+      positionTooltip(trigger, tooltip);
+      tooltip.classList.add('visible');
+    }
+  }, true);
+  document.addEventListener('mouseleave', function(e) {
+    var trigger = e.target instanceof Element ? e.target.closest('.info-trigger') : null;
+    if (!trigger) return;
+    var tooltip = trigger.querySelector('.info-tooltip');
+    if (tooltip && !tooltip.classList.contains('pinned')) {
+      tooltip.classList.remove('visible');
+    }
+  }, true);
+
+  document.addEventListener('click', function(e) {
+    var trigger = e.target instanceof Element ? e.target.closest('.info-trigger') : null;
+    var tooltip = trigger ? trigger.querySelector('.info-tooltip') : null;
+
+    document.querySelectorAll('.info-tooltip.pinned').forEach(function(t) {
+      if (t !== tooltip) { t.classList.remove('pinned', 'visible'); }
+    });
+    if (tooltip) {
+      e.stopPropagation();
+      var wasPinned = tooltip.classList.contains('pinned');
+      if (wasPinned) {
+        tooltip.classList.remove('pinned', 'visible');
+      } else {
+        positionTooltip(trigger, tooltip);
+        tooltip.classList.add('pinned', 'visible');
+      }
+    }
+  });
+
+  var protectionStatus = document.getElementById('protection-status');
+  var protectionInterval = null;
+  var protectionUntil = null;
+
+  function formatCountdown(secs) {
+    if (secs <= 0) return '';
+    var m = Math.floor(secs / 60);
+    var s = secs % 60;
+    if (m >= 60) {
+      var h = Math.floor(m / 60);
+      m = m % 60;
+      return h + 'h ' + m + 'm';
+    }
+    return m + 'm ' + s + 's';
+  }
+
+  function renderProtection(enabled, until) {
+    protectionUntil = until;
+    if (enabled) {
+      protectionStatus.innerHTML =
+        '<svg class="w-4 h-4 tone-good" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clip-rule="evenodd"/></svg>' +
+        '<span class="tone-good text-sm font-medium">Protected</span>' +
+        '<svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>';
+      if (protectionInterval) { clearInterval(protectionInterval); protectionInterval = null; }
+    } else {
+      var countdown = until ? formatCountdown(until - Math.floor(Date.now() / 1000)) : '';
+      protectionStatus.innerHTML =
+        '<svg class="w-4 h-4 tone-danger" fill="currentColor" viewBox="0 0 20 20"><path d="M10 2a5 5 0 00-5 5v2a2 2 0 00-2 2v5a2 2 0 002 2h10a2 2 0 002-2v-5a2 2 0 00-2-2H7V7a3 3 0 015.905-.75 1 1 0 001.937-.5A5.002 5.002 0 0010 2z"/></svg>' +
+        '<span class="tone-danger text-sm font-medium">Unprotected</span>' +
+        (countdown ? '<span class="text-slate-400 text-xs">' + countdown + '</span>' : '') +
+        '<svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>';
+      if (until && !protectionInterval) {
+        protectionInterval = setInterval(function() {
+          var remaining = protectionUntil - Math.floor(Date.now() / 1000);
+          if (remaining <= 0) {
+            clearInterval(protectionInterval);
+            protectionInterval = null;
+            fetchProtection();
+          } else {
+            renderProtection(false, protectionUntil);
+          }
+        }, 1000);
+      }
+    }
+  }
+
+  function fetchProtection() {
+    fetch('/api/protection').then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); }).then(function(d) {
+      renderProtection(d.enabled, d.until);
+    }).catch(function() { protectionStatus.textContent = 'Protection unavailable'; });
+  }
+
+  function showProtectionMenu(e) {
+    var existing = document.getElementById('protection-menu');
+    if (existing) { existing.remove(); protectionStatus.setAttribute('aria-expanded', 'false'); return; }
+    var menu = document.createElement('div');
+    menu.id = 'protection-menu';
+    menu.className = 'protection-menu';
+    protectionStatus.setAttribute('aria-expanded', 'true');
+    fetch('/api/protection').then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); }).then(function(d) {
+      if (d.enabled) {
+        menu.innerHTML =
+          '<div class="menu-label">Pause filtering for</div>' +
+          '<button data-duration="600" class="menu-item">10 minutes</button>' +
+          '<button data-duration="3600" class="menu-item">1 hour</button>' +
+          '<button data-duration="86400" class="menu-item">24 hours</button>' +
+          '<div class="menu-divider"></div>' +
+          '<button data-duration="0" class="menu-item tone-danger">Indefinitely</button>';
+      } else {
+        menu.innerHTML =
+          '<button data-enable="true" class="menu-item tone-good">Re-enable protection</button>';
+      }
+    }).catch(function() { menu.innerHTML = '<p role="alert" class="error-state">Could not load protection state.</p>'; });
+    protectionStatus.parentElement.style.position = 'relative';
+    protectionStatus.parentElement.appendChild(menu);
+    menu.addEventListener('click', function(ev) {
+      var btn = ev.target.closest('button');
+      if (!btn || btn.disabled) return;
+      menu.querySelectorAll('button').forEach(function(b) { b.disabled = true; });
+      var body;
+      if (btn.dataset.enable) {
+        body = {enabled: true};
+      } else {
+        var dur = parseInt(btn.dataset.duration, 10);
+        body = dur > 0 ? {enabled: false, duration: dur} : {enabled: false};
+      }
+      fetch('/api/protection', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function(d) {
+          renderProtection(d.enabled, d.until);
+          menu.remove();
+          protectionStatus.setAttribute('aria-expanded', 'false');
+          protectionStatus.focus();
+        }).catch(function() { menu.innerHTML = '<p role="alert" class="error-state">Could not change filtering. Close and retry.</p>'; });
+    });
+    setTimeout(function() {
+      document.addEventListener('click', function closeMenu(ev) {
+        if (!menu.contains(ev.target) && !protectionStatus.contains(ev.target)) {
+          menu.remove();
+          protectionStatus.setAttribute('aria-expanded', 'false');
+          document.removeEventListener('click', closeMenu);
+        }
+      });
+    }, 0);
+  }
+
+  protectionStatus.addEventListener('click', showProtectionMenu);
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      var menu = document.getElementById('protection-menu');
+      if (menu) { menu.remove(); protectionStatus.focus(); }
+      protectionStatus.setAttribute('aria-expanded', 'false');
+    }
+  });
+  var collapse = document.getElementById('sidebar-collapse'), root = document.documentElement;
+  function syncCollapse() {
+    var c = root.classList.contains('sidebar-collapsed');
+    collapse.setAttribute('aria-pressed', String(c));
+    collapse.setAttribute('aria-label', c ? 'Expand sidebar' : 'Collapse sidebar');
+  }
+  collapse.addEventListener('click', function() {
+    var c = root.classList.toggle('sidebar-collapsed');
+    try { localStorage.setItem('bifrost.sidebar', c ? 'collapsed' : 'expanded'); } catch (e) {}
+    syncCollapse();
+  });
+  syncCollapse();
+  var toggle = document.querySelector('.sidebar-toggle');
+  toggle.addEventListener('click', function() {
+    var open = document.getElementById('app-sidebar').classList.toggle('open');
+    toggle.setAttribute('aria-expanded', String(open));
+  });
+  fetchProtection();
+  setInterval(fetchProtection, 30000);
+})();
+</script>
+</body>
+</html>

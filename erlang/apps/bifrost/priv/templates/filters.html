@@ -1,0 +1,155 @@
+<div class="st-layout">
+  <div class="st-main">
+    <dl class="st-stats" aria-label="Rule summary">
+      <div class="st-stat"><dt>Blocked domains</dt><dd id="n-block">—</dd></div>
+      <div class="st-stat"><dt>Allowed domains</dt><dd id="n-allow">—</dd></div>
+      <div class="st-stat"><dt>Rewrites</dt><dd id="n-rewrite">—</dd></div>
+      <div class="st-stat"><dt>Device rules</dt><dd id="n-client">—</dd></div>
+    </dl>
+
+    <section id="sec-order" class="st-section" aria-labelledby="order-title">
+      <header class="st-section__head"><div><h2 id="order-title">How rules apply</h2>
+        <p>Your rules sit on top of subscribed <a href="/blocklists" class="tone-cool">blocklists</a> and apply on every node. Each rule covers the domain and all of its subdomains, except rewrites, which match the exact name. The first match wins:</p></div></header>
+      <div class="st-row" style="grid-template-columns:1fr">
+        <div class="r-flow">
+          <b><svg class="ic r-ic-rewrite" aria-hidden="true"><use href="#i-rewrite"/></svg>Rewrite</b><i>→</i>
+          <b><svg class="ic r-ic-allow" aria-hidden="true"><use href="#i-allow"/></svg>Allow</b><i>→</i>
+          <b><svg class="ic r-ic-client" aria-hidden="true"><use href="#i-user"/></svg>Device block</b><i>→</i>
+          <b><svg class="ic r-ic-block" aria-hidden="true"><use href="#i-ban"/></svg>Block &amp; blocklists</b><i>→</i>
+          <b><svg class="ic" aria-hidden="true"><use href="#i-queries"/></svg>Upstream</b>
+        </div>
+      </div>
+    </section>
+
+    <section id="sec-block" class="st-section" aria-labelledby="block-title">
+      <header class="st-section__head"><div><h2 id="block-title">Blocked domains</h2><p>Blocked for every device, in addition to your blocklists.</p></div></header>
+      <form class="r-add" data-kind="block" novalidate>
+        <label class="st-field"><span>Domain</span><input name="domain" class="form-field" required placeholder="ads.example.com" autocomplete="off"></label>
+        <button type="submit" class="btn btn-primary">Block domain</button>
+      </form>
+      <div class="r-filter st-hidden" data-filter="block"><input type="search" class="form-field" placeholder="Filter…" aria-label="Filter blocked domains"></div>
+      <div id="block-rows" class="r-list"><p class="st-empty">Loading…</p></div>
+    </section>
+
+    <section id="sec-allow" class="st-section" aria-labelledby="allow-title">
+      <header class="st-section__head"><div><h2 id="allow-title">Allowed domains</h2><p>Always resolved, even if a blocklist or manual block matches. Use this to fix sites a blocklist breaks.</p></div></header>
+      <form class="r-add" data-kind="allow" novalidate>
+        <label class="st-field"><span>Domain</span><input name="domain" class="form-field" required placeholder="github.com" autocomplete="off"></label>
+        <button type="submit" class="btn btn-primary">Allow domain</button>
+      </form>
+      <div class="r-filter st-hidden" data-filter="allow"><input type="search" class="form-field" placeholder="Filter…" aria-label="Filter allowed domains"></div>
+      <div id="allow-rows" class="r-list"><p class="st-empty">Loading…</p></div>
+    </section>
+
+    <section id="sec-rewrite" class="st-section" aria-labelledby="rewrite-title">
+      <header class="st-section__head"><div><h2 id="rewrite-title">Rewrites</h2><p>Answer locally without asking an upstream. An IP target returns an A/AAAA record; a hostname target returns a CNAME.</p></div></header>
+      <form class="r-add r-add--3" data-kind="rewrite" novalidate>
+        <label class="st-field"><span>Domain</span><input name="domain" class="form-field" required placeholder="nas.home" autocomplete="off"></label>
+        <label class="st-field"><span>Answer with</span><input name="target" class="form-field" required placeholder="192.168.1.5 or host.example" autocomplete="off"></label>
+        <button type="submit" class="btn btn-primary">Add rewrite</button>
+      </form>
+      <div class="r-filter st-hidden" data-filter="rewrite"><input type="search" class="form-field" placeholder="Filter…" aria-label="Filter rewrites"></div>
+      <div id="rewrite-rows" class="r-list"><p class="st-empty">Loading…</p></div>
+    </section>
+
+    <section id="sec-client" class="st-section" aria-labelledby="client-title">
+      <header class="st-section__head"><div><h2 id="client-title">Device rules</h2><p>Block a domain for one device only. Allowed domains still take precedence. You can also add these from the Queries and Clients pages.</p></div></header>
+      <form class="r-add r-add--client" data-kind="client" novalidate>
+        <label class="st-field"><span>Device IP</span><input name="client_ip" class="form-field" required placeholder="192.168.1.42" autocomplete="off" list="known-clients"></label>
+        <label class="st-field"><span>Domain</span><input name="domain" class="form-field" required placeholder="games.example" autocomplete="off"></label>
+        <button type="submit" class="btn btn-primary">Block for device</button>
+        <datalist id="known-clients"></datalist>
+      </form>
+      <div class="r-filter st-hidden" data-filter="client"><input type="search" class="form-field" placeholder="Filter…" aria-label="Filter device rules"></div>
+      <div id="client-block-rows" class="r-list"><p class="st-empty">Loading…</p></div>
+    </section>
+
+    <div id="f-status" class="st-savebar st-hidden" role="status" aria-live="polite"><div class="st-savebar__status" id="f-status-text"></div></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var names = {}, data = {block: [], allow: [], rewrite: [], client: []}, filters = {block: '', allow: '', rewrite: '', client: ''}, toastTimer;
+  function $(id) { return document.getElementById(id); }
+  function make(tag, cls, v) { var e = document.createElement(tag); if (cls) e.className = cls; if (v != null) e.textContent = String(v); return e; }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function icon(name, cls) { var ns = 'http://www.w3.org/2000/svg', s = document.createElementNS(ns, 'svg'), u = document.createElementNS(ns, 'use'); s.setAttribute('class', 'ic ' + (cls || '')); s.setAttribute('aria-hidden', 'true'); u.setAttribute('href', '#i-' + name); s.appendChild(u); return s; }
+  function toast(msg, kind) {
+    var bar = $('f-status'); $('f-status-text').textContent = msg; bar.className = 'st-savebar ' + (kind || '');
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { bar.classList.add('st-hidden'); }, kind === 'error' ? 6000 : 3000);
+  }
+  function send(method, url, body) {
+    return fetch(url, {method: method, headers: {'Content-Type': 'application/json'}, body: body ? JSON.stringify(body) : undefined})
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (b) { if (!r.ok) throw new Error(b.error || ('HTTP ' + r.status)); return b; }); });
+  }
+
+  var kinds = {
+    block: {rows: 'block-rows', icon: 'ban', tone: 'r-ic-block', empty: 'No manually blocked domains.',
+      list: function () { return fetch('/api/blocks').then(function (r) { return r.json(); }).then(function (d) { return d.domains || []; }); },
+      text: function (d) { return d; },
+      add: function (f) { return send('POST', '/api/blocks', {domain: f.domain.value.trim()}).then(function () { return f.domain.value.trim() + ' blocked.'; }); },
+      del: function (d) { return send('DELETE', '/api/blocks', {domain: d}); }},
+    allow: {rows: 'allow-rows', icon: 'allow', tone: 'r-ic-allow', empty: 'No allowed domains.',
+      list: function () { return fetch('/api/allowlist').then(function (r) { return r.json(); }).then(function (d) { return (d.domains || []).sort(); }); },
+      text: function (d) { return d; },
+      add: function (f) { return send('POST', '/api/allowlist', {domain: f.domain.value.trim()}).then(function () { return f.domain.value.trim() + ' allowed.'; }); },
+      del: function (d) { return send('DELETE', '/api/allowlist/' + encodeURIComponent(d)); }},
+    rewrite: {rows: 'rewrite-rows', icon: 'rewrite', tone: 'r-ic-rewrite', empty: 'No rewrites.',
+      list: function () { return fetch('/api/rewrites').then(function (r) { return r.json(); }).then(function (d) { return (d.rewrites || []).sort(function (a, b) { return a.domain.localeCompare(b.domain); }); }); },
+      text: function (r) { return r.domain + ' ' + r.target; },
+      render: function (r, el) { el.append(document.createTextNode(r.domain), make('span', 'arrow', '→'), make('span', 'target', r.target)); },
+      add: function (f) { return send('POST', '/api/rewrites', {domain: f.domain.value.trim(), target: f.target.value.trim()}).then(function () { return 'Rewrite saved for ' + f.domain.value.trim() + '.'; }); },
+      del: function (r) { return send('DELETE', '/api/rewrites/' + encodeURIComponent(r.domain)); }, label: function (r) { return r.domain; }},
+    client: {rows: 'client-block-rows', icon: 'user', tone: 'r-ic-client', empty: 'No device rules.',
+      list: function () { return fetch('/api/client-blocks').then(function (r) { return r.json(); }).then(function (d) { return d.blocks || []; }); },
+      text: function (b) { return b.client_ip + ' ' + (names[b.client_ip] || '') + ' ' + b.domain; },
+      render: function (b, el) { el.append(document.createTextNode(b.domain), make('span', 'arrow', 'for'), make('span', 'target', names[b.client_ip] ? names[b.client_ip] + ' (' + b.client_ip + ')' : b.client_ip)); },
+      add: function (f) { return send('POST', '/api/client-blocks', {client_ip: f.client_ip.value.trim(), domain: f.domain.value.trim()}).then(function () { return f.domain.value.trim() + ' blocked for ' + f.client_ip.value.trim() + '.'; }); },
+      del: function (b) { return send('DELETE', '/api/client-blocks', {client_ip: b.client_ip, domain: b.domain}); }, label: function (b) { return b.domain + ' for ' + b.client_ip; }}
+  };
+
+  function render(kind) {
+    var k = kinds[kind], el = $(k.rows), q = filters[kind].toLowerCase(); clear(el);
+    $('n-' + kind).textContent = data[kind].length;
+    document.querySelector('[data-filter="' + kind + '"]').classList.toggle('st-hidden', data[kind].length < 8);
+    var items = data[kind].filter(function (x) { return !q || k.text(x).toLowerCase().indexOf(q) !== -1; });
+    if (!items.length) { el.appendChild(make('p', 'st-empty', data[kind].length ? 'Nothing matches this filter.' : k.empty)); return; }
+    items.forEach(function (x) {
+      var row = make('div', 'r-item'), text = make('span', 'mono'), label = k.label ? k.label(x) : x;
+      if (k.render) k.render(x, text); else text.textContent = x;
+      text.title = text.textContent;
+      var rm = make('button', 'ql-icon-btn'); rm.type = 'button'; rm.title = 'Remove'; rm.setAttribute('aria-label', 'Remove ' + label); rm.appendChild(icon('trash', 'ic-sm'));
+      rm.onclick = function () {
+        if (!confirm('Remove ' + label + '?')) return;
+        k.del(x).then(function () { toast('Removed ' + label + '.'); load(kind); }).catch(function (e) { toast('Could not remove: ' + e.message, 'error'); });
+      };
+      row.append(icon(k.icon, k.tone), text, rm); el.appendChild(row);
+    });
+  }
+  function load(kind) {
+    return kinds[kind].list().then(function (list) { data[kind] = list; render(kind); })
+      .catch(function () { var el = $(kinds[kind].rows); clear(el); el.appendChild(make('p', 'st-empty error-state', 'Could not load rules. Reload to retry.')); });
+  }
+
+  document.querySelectorAll('.r-add').forEach(function (form) {
+    var kind = form.dataset.kind;
+    form.addEventListener('submit', function (e) {
+      e.preventDefault(); if (!form.reportValidity()) return;
+      var btn = form.querySelector('button[type=submit]'); btn.disabled = true;
+      kinds[kind].add(form).then(function (msg) { toast(msg); form.reset(); load(kind); form.querySelector('input').focus(); })
+        .catch(function (err) { toast('Could not save: ' + err.message, 'error'); })
+        .finally(function () { btn.disabled = false; });
+    });
+  });
+  document.querySelectorAll('[data-filter]').forEach(function (wrap) {
+    wrap.querySelector('input').addEventListener('input', function (e) { filters[wrap.dataset.filter] = e.target.value.trim(); render(wrap.dataset.filter); });
+  });
+
+  ['block', 'allow', 'rewrite'].forEach(load);
+  fetch('/api/clients').then(function (r) { return r.json(); }).then(function (d) {
+    var dl = $('known-clients');
+    (d.clients || []).forEach(function (c) { if (c.name) names[c.ip] = c.name; var o = document.createElement('option'); o.value = c.ip; if (c.name) o.label = c.name; dl.appendChild(o); });
+  }).catch(function () {}).then(function () { load('client'); });
+})();
+</script>

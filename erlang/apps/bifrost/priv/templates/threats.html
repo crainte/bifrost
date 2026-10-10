@@ -1,0 +1,220 @@
+<div class="st-layout">
+  <div class="st-main">
+    <dl class="st-stats" aria-label="Threat summary">
+      <div class="st-stat accent"><dt>Awaiting review</dt><dd id="stat-pending">—</dd></div>
+      <div class="st-stat warn"><dt>At or above threshold</dt><dd id="stat-high">—</dd></div>
+      <div class="st-stat"><dt>Registered &lt; 30 days</dt><dd id="stat-young">—</dd></div>
+      <div class="st-stat"><dt>Auto-block</dt><dd id="stat-auto">—</dd></div>
+    </dl>
+
+    <section id="sec-queue" class="st-section" aria-labelledby="queue-title">
+      <header class="st-section__head">
+        <div><h2 id="queue-title">Review queue</h2><p>Likely ad or throwaway domains seen in forwarded traffic, collapsed to the registrable domain. Blocking covers every subdomain; dismissing marks the domain safe.</p></div>
+        <div class="st-section__actions"><button type="button" id="t-scan" class="btn btn-secondary btn-sm">Scan now</button></div>
+      </header>
+      <div class="st-toolbar">
+        <input type="search" id="t-search" class="form-field" placeholder="Filter domains or reasons…" aria-label="Filter candidates" autocomplete="off">
+        <label class="st-inline">Sort
+          <select id="t-sort" class="form-field" style="min-width:150px;flex:0 0 auto">
+            <option value="score">Highest score</option><option value="hits">Most queried</option><option value="age">Newest registration</option><option value="seen">Recently seen</option>
+          </select></label>
+        <span class="st-toolbar__spacer"></span>
+        <label class="st-inline"><input type="checkbox" class="st-check" id="t-threshold"> Only at threshold</label>
+      </div>
+      <div id="t-bulk" class="st-bulk st-hidden" role="region" aria-label="Bulk actions">
+        <strong id="t-bulk-count">0 selected</strong>
+        <span class="st-toolbar__spacer"></span>
+        <button type="button" class="btn btn-ghost btn-sm" id="t-bulk-clear">Clear</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="t-bulk-dismiss">Dismiss selected</button>
+        <button type="button" class="btn btn-danger btn-sm" id="t-bulk-block">Block selected</button>
+      </div>
+      <div class="table-wrap"><table class="data-table">
+        <thead><tr>
+          <th style="width:36px"><input type="checkbox" class="st-check" id="t-select-all" aria-label="Select all visible"></th>
+          <th>Domain</th><th style="width:70px">Score</th><th>Signals</th>
+          <th style="width:80px;text-align:right">Queries</th><th style="width:90px;text-align:right">Age</th><th style="width:170px"></th>
+        </tr></thead>
+        <tbody id="t-rows"><tr><td colspan="7" class="st-empty">Loading…</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <section id="sec-policy" class="st-section" aria-labelledby="policy-title">
+      <header class="st-section__head">
+        <div><h2 id="policy-title">Auto-block policy</h2><p>Leave this off until the review queue has proven reliable on your network. Auto-blocked domains can be removed from the Rules page.</p></div>
+      </header>
+      <form id="ab-form" novalidate>
+        <div class="st-row">
+          <div class="st-row__label"><h3>Automatic blocking</h3><p>Applied after every scan.</p></div>
+          <div class="st-row__control"><label class="st-switch" style="max-width:520px"><input id="ab-enabled" type="checkbox"><div><strong>Block high-confidence candidates automatically</strong><span>Only domains that meet both thresholds below are blocked.</span></div></label></div>
+        </div>
+        <div class="st-row">
+          <div class="st-row__label"><h3>Thresholds</h3><p>A domain must score at least the minimum <em>and</em> have a known registration date younger than the maximum age.</p></div>
+          <div class="st-row__control">
+            <div class="st-fields">
+              <label class="st-field"><span>Minimum score</span><div class="st-unit"><input id="ab-score" type="number" min="1" max="30" required><em>pts</em></div><small>1 – 30</small></label>
+              <label class="st-field"><span>Registered within</span><div class="st-unit"><input id="ab-age" type="number" min="1" max="365" required><em>days</em></div><small>1 – 365</small></label>
+            </div>
+            <div id="ab-preview" class="st-callout info"></div>
+          </div>
+        </div>
+        <div class="st-row">
+          <div class="st-row__label"></div>
+          <div class="st-row__control" style="flex-direction:row;align-items:center;gap:12px"><button type="submit" class="btn btn-primary" id="ab-save">Save policy</button><span id="ab-status" class="section-kicker" role="status" aria-live="polite"></span></div>
+        </div>
+      </form>
+    </section>
+
+    <section id="sec-signals" class="st-section" aria-labelledby="signals-title">
+      <header class="st-section__head"><div><h2 id="signals-title">How scoring works</h2><p>Each signal adds points. Higher scores indicate more evidence, not certainty.</p></div></header>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Signal sources</h3><p>Shown as tags on each candidate.</p></div>
+        <div class="st-row__control"><dl class="st-switches">
+          <div class="st-tile"><dt><span class="tag">Bifrost signal</span></dt><dd>Bifrost's own analysis of the name and traffic pattern: random-looking labels, numbered subdomains, query bursts.</dd></div>
+          <div class="st-tile"><dt><span class="tag tag-rdap">Registry signal</span></dt><dd>RDAP facts such as registration age or pending deletion. Looked up once per registrable domain and cached.</dd></div>
+        </dl></div>
+      </div>
+    </section>
+
+    <div id="t-status" class="st-savebar st-hidden" role="status" aria-live="polite"><div class="st-savebar__status" id="t-status-text"></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  var all = [], selected = new Set(), policy = {enabled: false, score: 9, age: 30}, toastTimer;
+  function $(id) { return document.getElementById(id); }
+  function make(tag, cls, v) { var e = document.createElement(tag); if (cls) e.className = cls; if (v != null) e.textContent = String(v); return e; }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function post(url, body) {
+    return fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})})
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json().catch(function () { return {}; }); });
+  }
+  function toast(msg, kind) {
+    var bar = $('t-status'); $('t-status-text').textContent = msg; bar.className = 'st-savebar ' + (kind || '');
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { bar.classList.add('st-hidden'); }, kind === 'error' ? 7000 : 3500);
+  }
+  function matchesPolicy(t) { return t.score >= policy.score && t.age_days != null && t.age_days < policy.age; }
+  function sevClass(score) { return score >= policy.score ? 'sev sev-high' : score >= policy.score - 3 ? 'sev sev-mid' : 'sev sev-low'; }
+  function relative(iso) {
+    if (!iso) return ''; var s = (Date.now() - Date.parse(iso)) / 1000; if (isNaN(s)) return '';
+    if (s < 3600) return 'first seen ' + Math.max(1, Math.round(s / 60)) + 'm ago';
+    if (s < 86400) return 'first seen ' + Math.round(s / 3600) + 'h ago';
+    return 'first seen ' + Math.round(s / 86400) + 'd ago';
+  }
+  function visible() {
+    var q = $('t-search').value.trim().toLowerCase(), only = $('t-threshold').checked, sort = $('t-sort').value;
+    var list = all.filter(function (t) {
+      if (only && t.score < policy.score) return false;
+      return !q || (t.domain + ' ' + (t.reasons || []).join(' ')).toLowerCase().indexOf(q) !== -1;
+    });
+    var key = {score: function (t) { return -t.score; }, hits: function (t) { return -t.hits; },
+               age: function (t) { return t.age_days == null ? 1e9 : t.age_days; }, seen: function (t) { return -(Date.parse(t.first_seen) || 0); }}[sort];
+    return list.sort(function (a, b) { return key(a) - key(b) || b.score - a.score; });
+  }
+  function renderStats() {
+    $('stat-pending').textContent = all.length;
+    $('stat-high').textContent = all.filter(function (t) { return t.score >= policy.score; }).length;
+    $('stat-young').textContent = all.filter(function (t) { return t.age_days != null && t.age_days < 30; }).length;
+    $('stat-auto').textContent = policy.enabled ? 'On' : 'Off';
+  }
+  function renderRows() {
+    var rows = $('t-rows'), list = visible(); clear(rows);
+    if (!list.length) {
+      var tr = make('tr'), td = make('td', 'st-empty', all.length ? 'No candidates match your filters.' : 'Nothing to review. New candidates appear after each scan.');
+      td.colSpan = 7; tr.appendChild(td); rows.appendChild(tr);
+    }
+    list.forEach(function (t) {
+      var tr = make('tr'), cb = make('input', 'st-check');
+      cb.type = 'checkbox'; cb.checked = selected.has(t.domain); cb.setAttribute('aria-label', 'Select ' + t.domain);
+      cb.onchange = function () { cb.checked ? selected.add(t.domain) : selected.delete(t.domain); syncBulk(); };
+      var c0 = make('td'); c0.appendChild(cb);
+      var c1 = make('td', 't-domain', t.domain); var rel = relative(t.first_seen); if (rel) c1.appendChild(make('small', null, rel));
+      var c2 = make('td'); var sev = make('span', sevClass(t.score), t.score); sev.title = t.score >= policy.score ? 'At or above auto-block threshold' : 'Below auto-block threshold'; c2.appendChild(sev);
+      var c3 = make('td'), tags = make('div', 't-tags');
+      (t.reasons || []).forEach(function (r) {
+        var rdap = r.indexOf('rdap:') === 0, tag = make('span', rdap ? 'tag tag-rdap' : 'tag', (rdap ? r.slice(5) : r).replace(/_/g, ' '));
+        if (rdap) tag.title = 'From RDAP registry data'; tags.appendChild(tag);
+      });
+      c3.appendChild(tags);
+      var c4 = make('td', null, Number(t.hits || 0).toLocaleString()); c4.style.textAlign = 'right';
+      var c5 = make('td'); c5.style.textAlign = 'right';
+      c5.appendChild(t.age_days == null ? make('span', 'section-kicker', 'unknown') : make('span', 'pill ' + (t.age_days < 30 ? 'pill-danger' : t.age_days < 90 ? 'pill-warn' : 'pill-muted'), t.age_days >= 730 ? Math.floor(t.age_days / 365) + 'y' : t.age_days + 'd'));
+      var c6 = make('td'), acts = make('div', 't-actions'), dismiss = make('button', 'btn btn-ghost btn-sm', 'Dismiss'), blk = make('button', 'btn btn-danger btn-sm', 'Block');
+      dismiss.type = blk.type = 'button';
+      dismiss.onclick = function () { act([t.domain], 'dismiss'); };
+      blk.onclick = function () { act([t.domain], 'block'); };
+      acts.append(dismiss, blk); c6.appendChild(acts);
+      tr.append(c0, c1, c2, c3, c4, c5, c6); rows.appendChild(tr);
+    });
+    var vis = list.map(function (t) { return t.domain; }), sa = $('t-select-all');
+    sa.checked = vis.length > 0 && vis.every(function (d) { return selected.has(d); });
+    sa.indeterminate = !sa.checked && vis.some(function (d) { return selected.has(d); });
+    syncBulk();
+  }
+  function syncBulk() {
+    $('t-bulk').classList.toggle('st-hidden', selected.size === 0);
+    $('t-bulk-count').textContent = selected.size + ' selected';
+  }
+  function act(domains, kind) {
+    if (domains.length > 1 && !confirm((kind === 'block' ? 'Block ' : 'Dismiss ') + domains.length + ' domains?')) return;
+    var url = kind === 'block' ? '/api/threats/block' : '/api/threats/dismiss', failed = [], queue = domains.slice();
+    function worker() {
+      var d = queue.shift(); if (!d) return Promise.resolve();
+      return post(url, {domain: d}).catch(function () { failed.push(d); }).then(worker);
+    }
+    var workers = []; for (var i = 0; i < Math.min(4, domains.length); i++) workers.push(worker());
+    toast((kind === 'block' ? 'Blocking ' : 'Dismissing ') + domains.length + '…', 'pending');
+    Promise.all(workers).then(function () {
+      domains.forEach(function (d) { if (failed.indexOf(d) === -1) selected.delete(d); });
+      if (failed.length) toast(failed.length + ' of ' + domains.length + ' failed. They remain selected.', 'error');
+      else toast(domains.length === 1 ? domains[0] + (kind === 'block' ? ' blocked.' : ' dismissed.') : domains.length + ' domains ' + (kind === 'block' ? 'blocked.' : 'dismissed.'));
+      load();
+    });
+  }
+  $('t-select-all').addEventListener('change', function () {
+    var on = this.checked; visible().forEach(function (t) { on ? selected.add(t.domain) : selected.delete(t.domain); }); renderRows();
+  });
+  $('t-bulk-clear').onclick = function () { selected.clear(); renderRows(); };
+  $('t-bulk-block').onclick = function () { act(Array.from(selected), 'block'); };
+  $('t-bulk-dismiss').onclick = function () { act(Array.from(selected), 'dismiss'); };
+  ['t-search', 't-sort', 't-threshold'].forEach(function (id) { $(id).addEventListener(id === 't-search' ? 'input' : 'change', renderRows); });
+
+  $('t-scan').addEventListener('click', function () {
+    var btn = this; btn.disabled = true; btn.textContent = 'Scanning…';
+    post('/api/threats/scan').then(function () { toast('Scan started. Results appear in a few seconds.', 'pending'); })
+      .catch(function () { toast('Could not start a scan.', 'error'); })
+      .finally(function () { setTimeout(function () { load(); btn.disabled = false; btn.textContent = 'Scan now'; }, 4000); });
+  });
+
+  function renderPreview() {
+    var s = Number($('ab-score').value), a = Number($('ab-age').value);
+    var n = all.filter(function (t) { return t.score >= s && t.age_days != null && t.age_days < a; }).length;
+    $('ab-preview').textContent = n + ' of the ' + all.length + ' candidates in the queue would be blocked by these thresholds' + ($('ab-enabled').checked ? ' on the next scan.' : ' if automatic blocking were on.');
+  }
+  ['ab-score', 'ab-age', 'ab-enabled'].forEach(function (id) { $(id).addEventListener('input', renderPreview); $(id).addEventListener('change', renderPreview); });
+  $('ab-form').addEventListener('submit', function (e) {
+    e.preventDefault(); if (!this.reportValidity()) return;
+    var enabled = $('ab-enabled').checked;
+    if (enabled && !policy.enabled && !confirm('Turn on automatic blocking? Matching domains will be blocked without review.')) return;
+    $('ab-save').disabled = true; $('ab-status').textContent = 'Saving…';
+    post('/api/threats/settings', {auto_block_enabled: enabled ? 'true' : 'false', auto_block_min_score: String($('ab-score').value), auto_block_max_age_days: String($('ab-age').value)})
+      .then(function (s) { applyPolicy(s); $('ab-status').textContent = 'Saved.'; renderRows(); })
+      .catch(function () { $('ab-status').textContent = 'Could not save. Try again.'; })
+      .finally(function () { $('ab-save').disabled = false; setTimeout(function () { $('ab-status').textContent = ''; }, 3000); });
+  });
+  function applyPolicy(s) {
+    policy = {enabled: s.auto_block_enabled === 'true', score: Number(s.auto_block_min_score || 9), age: Number(s.auto_block_max_age_days || 30)};
+    $('ab-enabled').checked = policy.enabled; $('ab-score').value = policy.score; $('ab-age').value = policy.age;
+    renderStats(); renderPreview();
+  }
+  function load() {
+    return fetch('/api/threats').then(function (r) { if (!r.ok) throw new Error(); return r.json(); }).then(function (d) {
+      all = (d && d.threats) || [];
+      var present = new Set(all.map(function (t) { return t.domain; }));
+      selected.forEach(function (x) { if (!present.has(x)) selected.delete(x); });
+      renderStats(); renderRows(); renderPreview();
+    }).catch(function () { var rows = $('t-rows'); clear(rows); var tr = make('tr'), td = make('td', 'st-empty error-state', 'Could not load candidates. Reload to retry.'); td.colSpan = 7; tr.appendChild(td); rows.appendChild(tr); });
+  }
+
+  fetch('/api/threats/settings').then(function (r) { return r.json(); }).then(applyPolicy).catch(function () {}).then(load);
+})();
+</script>

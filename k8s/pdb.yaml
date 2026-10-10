@@ -1,0 +1,13 @@
+# Voluntary disruptions (node drains, upgrades) take at most one DNS pod at a
+# time. Clients list every per-pod DNS IP and fail over between them, so losing
+# two of three at once is a visible outage; losing one is not.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bifrost
+  namespace: bifrost
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: bifrost

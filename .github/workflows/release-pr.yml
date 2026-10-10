@@ -1,0 +1,87 @@
+name: Release PR
+
+# Step 1 of a release. Opens a PR that bumps the version everywhere and
+# updates CHANGELOG.md. Merging that PR triggers release.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump. auto = derived from conventional commits."
+        required: true
+        default: auto
+        type: choice
+        options: [auto, patch, minor, major]
+      version:
+        description: "Exact version override (e.g. 1.2.3). Takes precedence over bump."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Determine version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          OVERRIDE: ${{ inputs.version }}
+        run: |
+          if [ -n "$OVERRIDE" ]; then
+            version="$OVERRIDE"
+          elif [ "$BUMP" = auto ]; then
+            version="$(git cliff --bumped-version)"
+          else
+            version="$(git cliff --bumped-version --bump "$BUMP")"
+          fi
+          version="${version#v}"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::v$version is already released. No releasable commits, or pass a version override."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version and changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          scripts/bump-version.sh "$VERSION"
+          git cliff --tag "$TAG" -o CHANGELOG.md
+          RELEASE_NOTES=1 git cliff --tag "$TAG" --unreleased --strip all > "$RUNNER_TEMP/notes.md"
+          {
+            echo "body<<CLIFF_EOF"
+            cat "$RUNNER_TEMP/notes.md"
+            echo "CLIFF_EOF"
+          } >> "$GITHUB_ENV"
+
+      # A PR opened with the default GITHUB_TOKEN does not trigger CI. Set a
+      # RELEASE_TOKEN secret (fine-grained PAT: contents + pull requests write)
+      # to get checks on the release PR; without it, close and reopen the PR.
+      # release.yml runs the full CI as a gate either way.
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          branch: release/${{ steps.version.outputs.tag }}
+          delete-branch: true
+          commit-message: "chore(release): ${{ steps.version.outputs.tag }}"
+          title: "chore(release): ${{ steps.version.outputs.tag }}"
+          labels: release
+          body: |
+            ${{ env.body }}
+
+            ---
+
+            Merging this PR releases **${{ steps.version.outputs.tag }}**: CI runs as a gate, then the tag, GitHub release, and `ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}` image are created.

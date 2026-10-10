@@ -1,0 +1,36 @@
+# Erlang distribution (epmd 4369, dist 9100) authenticates peers ONLY with the
+# cookie, and an accepted peer gets full code execution on the node. Nothing but
+# other Bifrost pods may reach those ports. DNS and the web UI stay reachable;
+# put the UI behind your ingress/auth as usual.
+#
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, ...). On one that
+# does not, this object is silently ignored, so verify enforcement.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bifrost
+  namespace: bifrost
+spec:
+  podSelector:
+    matchLabels:
+      app: bifrost
+  policyTypes: ["Ingress"]
+  ingress:
+    # DNS from clients, and the web UI/API (ingress controller, probes).
+    - ports:
+        - port: 5454
+          protocol: UDP
+        - port: 5454
+          protocol: TCP
+        - port: 8081
+          protocol: TCP
+    # Cluster membership: Bifrost pods only.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: bifrost
+      ports:
+        - port: 4369
+          protocol: TCP
+        - port: 9100
+          protocol: TCP

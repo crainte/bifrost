@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bifrost
+      POSTGRES_USER: bifrost
+      POSTGRES_PASSWORD: bifrost
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bifrost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  bifrost:
+    build:
+      context: .
+      dockerfile: erlang/Dockerfile
+    ports:
+      # Host 1053 -> container 5454. Unprivileged: neither side touches port 53.
+      # Point a real resolver at host:1053, or remap 53:5454 if you run as root.
+      - "1053:5454/udp"
+      - "1053:5454/tcp"
+      - "8081:8081"
+    volumes:
+      - ./dev/config.yaml:/etc/bifrost/config.yaml:ro
+    environment:
+      BIFROST_CONFIG_PATH: /etc/bifrost/config.yaml
+      BIFROST_RUST_BIN: /usr/local/bin/bifrost-resolver
+      BIFROST_LISTEN_ADDR: 0.0.0.0:5454
+      RUST_LOG: bifrost_resolver::listener=debug
+      ## Clustering: set BIFROST_CLUSTER_NODES to a comma-separated list
+      ## of Erlang node names (name@host) for distributed operation.
+      ## Example: "bifrost@bifrost-1,bifrost@bifrost-2,bifrost@bifrost-3"
+      ## Each container needs a unique hostname matching its entry.
+      # BIFROST_CLUSTER_NODES: "bifrost@bifrost-1,bifrost@bifrost-2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    # Trusted events (push, release) may use self-hosted runners via the RUNNER
+    # repo variable. Pull requests, including forks, always use GitHub-hosted.
+    runs-on: ${{ github.event_name != 'pull_request' && vars.RUNNER || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      # The ARC runner image (ghcr.io/actions/actions-runner) ships no C
+      # toolchain, and rustc needs `cc` to link. No-op on GitHub-hosted.
+      - name: Ensure a C linker
+        run: |
+          command -v cc >/dev/null && exit 0
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends build-essential
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  erlang:
+    name: Erlang
+    runs-on: ${{ github.event_name != 'pull_request' && vars.RUNNER || 'ubuntu-latest' }}
+    # Same image the Dockerfile builds with; the Postgres service is reachable
+    # as host "postgres", which is the test suites' default.
+    container: erlang:26
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: bifrost
+          POSTGRES_USER: bifrost
+          POSTGRES_PASSWORD: bifrost
+        options: >-
+          --health-cmd "pg_isready -U bifrost"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BIFROST_TEST_DB_HOST: postgres
+    defaults:
+      run:
+        working-directory: erlang
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/rebar3
+            erlang/_build
+          key: rebar3-${{ hashFiles('erlang/rebar.lock') }}
+          restore-keys: rebar3-
+      - run: rebar3 compile
+      - run: rebar3 eunit
+      # --sname is required: without a distributed node the two-node cluster
+      # suite skips instead of running.
+      - run: |
+          epmd -daemon
+          rebar3 ct --sname ctrunner --readable=true
+      - name: Upload CT logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ct-logs
+          path: erlang/_build/test/logs
+          retention-days: 7
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+  manifests:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: kubectl kustomize k8s/ > /dev/null
+
+  image:
+    name: Docker build
+    runs-on: ${{ github.event_name != 'pull_request' && vars.RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: erlang/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

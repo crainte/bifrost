@@ -1,0 +1,239 @@
+<div class="st-layout">
+  <div class="st-main">
+    <dl class="st-stats" aria-label="Blocklist summary">
+      <div class="st-stat accent"><dt>Blocked domains</dt><dd id="stat-domains">—</dd></div>
+      <div class="st-stat"><dt>Active lists</dt><dd id="stat-active">—</dd></div>
+      <div class="st-stat"><dt>Disabled</dt><dd id="stat-disabled">—</dd></div>
+      <div class="st-stat warn st-hidden" id="stat-empty-wrap"><dt>Not yet fetched</dt><dd id="stat-empty">—</dd></div>
+    </dl>
+
+    <section id="sec-lists" class="st-section" aria-labelledby="lists-title">
+      <header class="st-section__head">
+        <div><h2 id="lists-title">Your lists</h2><p>Enabled lists are applied to every DNS query on every node. Lists refresh automatically once a day.</p></div>
+        <div class="st-section__actions"><button type="button" class="btn btn-secondary btn-sm" id="refresh-all-btn" title="Re-fetch and re-parse every list, then flush the DNS cache">Refresh all now</button></div>
+      </header>
+      <div id="active-lists" class="st-list"><p class="st-empty">Loading…</p></div>
+    </section>
+
+    <section id="sec-catalog" class="st-section" aria-labelledby="catalog-title">
+      <header class="st-section__head">
+        <div><h2 id="catalog-title">Add lists</h2><p>Pick from curated sources, or subscribe to any domains, hosts or adblock-format list by URL.</p></div>
+      </header>
+      <div class="st-toolbar">
+        <input type="search" class="form-field" id="builtin-search" placeholder="Search the catalog…" aria-label="Search the catalog" autocomplete="off">
+        <div class="st-chips" id="cat-chips" role="group" aria-label="Filter by category"></div>
+        <span class="st-toolbar__spacer"></span>
+        <label class="st-inline"><input type="checkbox" class="st-check" id="hide-added"> Hide added</label>
+      </div>
+      <div id="catalog-grid" class="st-catalog"><p class="st-empty">Loading catalog…</p></div>
+      <form id="custom-form" class="st-custom" novalidate>
+        <label class="st-field"><span>Custom list name</span><input class="form-field" id="add-name" required maxlength="80" placeholder="My list" autocomplete="off"></label>
+        <label class="st-field"><span>List URL</span><input class="form-field" id="add-url" type="url" required placeholder="https://example.com/blocklist.txt" autocomplete="off"></label>
+        <button type="submit" class="btn btn-primary">Add custom list</button>
+      </form>
+    </section>
+
+    <section id="sec-analysis" class="st-section" aria-labelledby="analysis-title">
+      <header class="st-section__head">
+        <div><h2 id="analysis-title">Coverage analysis</h2><p>Find lists that mostly duplicate another list. Redundant lists cost memory and refresh time without blocking anything extra.</p></div>
+        <div class="st-section__actions"><button type="button" class="btn btn-primary btn-sm" id="run-analysis-btn">Run analysis</button></div>
+      </header>
+      <div id="analysis-results"><p class="st-empty">Run the analysis to compare your active lists. It may take a few seconds with large lists.</p></div>
+    </section>
+
+    <div id="bl-status" class="st-savebar st-hidden" role="status" aria-live="polite"><div class="st-savebar__status" id="bl-status-text"></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  var active = [], catalog = {categories: [], lists: []}, cat = 'recommended', term = '', toastTimer;
+  function $(id) { return document.getElementById(id); }
+  function make(tag, cls, v) { var e = document.createElement(tag); if (cls) e.className = cls; if (v != null) e.textContent = String(v); return e; }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function num(n) { return (Number(n) || 0).toLocaleString(); }
+  function toast(msg, kind) {
+    var bar = $('bl-status'); $('bl-status-text').textContent = msg;
+    bar.className = 'st-savebar ' + (kind || ''); clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { bar.classList.add('st-hidden'); }, kind === 'error' ? 7000 : 3500);
+  }
+  function api(url, opts) {
+    return fetch(url, opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (b) { if (!r.ok || b.ok === false) throw new Error(b.error || ('HTTP ' + r.status)); return b; });
+    });
+  }
+  function post(url, body) { return api(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})}); }
+  function isAdded(url) { return active.some(function (a) { return a.url === url; }); }
+
+  function renderStats() {
+    var on = active.filter(function (x) { return x.enabled; });
+    var empty = on.filter(function (x) { return !x.domains; }).length;
+    $('stat-domains').textContent = num(on.reduce(function (s, x) { return s + (x.domains || 0); }, 0));
+    $('stat-active').textContent = on.length;
+    $('stat-disabled').textContent = active.length - on.length;
+    $('stat-empty').textContent = empty; $('stat-empty-wrap').classList.toggle('st-hidden', !empty);
+  }
+
+  function renderActive() {
+    var el = $('active-lists'); clear(el);
+    if (!active.length) { el.appendChild(make('p', 'st-empty', 'No lists yet. Add one from the catalog below.')); return; }
+    active.slice().sort(function (a, b) { return (b.enabled - a.enabled) || ((b.domains || 0) - (a.domains || 0)); }).forEach(function (x) {
+      var row = make('div', 'st-item' + (x.enabled ? '' : ' is-off'));
+      var body = make('div'), title = make('h3', 'st-item__title', x.name), sub = make('div', 'st-item__sub mono', x.url);
+      sub.title = x.url;
+      if (x.enabled && !x.domains) title.appendChild(make('span', 'pill pill-warn', 'Pending fetch'));
+      body.append(title, sub);
+      var meta = make('div', 'st-item__meta'), count = make('div', 'st-count', num(x.domains));
+      count.appendChild(make('span', null, 'domains'));
+      var toggle = make('input', 'st-toggle'); toggle.type = 'checkbox'; toggle.checked = !!x.enabled;
+      toggle.setAttribute('aria-label', (x.enabled ? 'Disable ' : 'Enable ') + x.name);
+      toggle.onchange = function () {
+        toggle.disabled = true;
+        post('/api/blocklists/' + encodeURIComponent(x.name) + '/toggle')
+          .then(function () { toast(x.name + (toggle.checked ? ' enabled.' : ' disabled.')); load(); })
+          .catch(function (e) { toggle.checked = !toggle.checked; toggle.disabled = false; toast('Could not update ' + x.name + ': ' + e.message, 'error'); });
+      };
+      var rm = make('button', 'st-icon-btn', '×'); rm.type = 'button'; rm.title = 'Remove list'; rm.setAttribute('aria-label', 'Remove ' + x.name);
+      rm.onclick = function () {
+        if (!confirm('Remove "' + x.name + '"? Its domains stop being blocked on every node.')) return;
+        api('/api/blocklists/' + encodeURIComponent(x.name), {method: 'DELETE'})
+          .then(function () { toast(x.name + ' removed.'); load(); })
+          .catch(function (e) { toast('Could not remove ' + x.name + ': ' + e.message, 'error'); });
+      };
+      meta.append(count, toggle, rm); row.append(body, meta); el.appendChild(row);
+    });
+  }
+
+  function renderChips() {
+    var el = $('cat-chips'); clear(el);
+    [{id: 'recommended', name: 'Recommended'}, {id: 'all', name: 'All'}].concat(catalog.categories || []).forEach(function (c) {
+      var n = (catalog.lists || []).filter(function (l) { return c.id === 'all' || (c.id === 'recommended' ? l.recommended : l.category === c.id); }).length;
+      var b = make('button', 'filter-chip' + (cat === c.id ? ' active' : ''), c.name + ' ' + n); b.type = 'button';
+      b.setAttribute('aria-pressed', String(cat === c.id));
+      b.onclick = function () { cat = c.id; renderChips(); renderCatalog(); };
+      el.appendChild(b);
+    });
+  }
+
+  function renderCatalog() {
+    var el = $('catalog-grid'), hide = $('hide-added').checked; clear(el);
+    var lists = (catalog.lists || []).filter(function (l) {
+      if (cat === 'recommended' ? !l.recommended : (cat !== 'all' && l.category !== cat)) return false;
+      if (hide && isAdded(l.url)) return false;
+      return !term || (l.name + ' ' + (l.description || '')).toLowerCase().indexOf(term) !== -1;
+    });
+    if (!lists.length) { el.appendChild(make('p', 'st-empty', 'No lists match your filters.')); return; }
+    if (term && cat === 'recommended') { cat = 'all'; renderChips(); return renderCatalog(); }
+    var order = (catalog.categories || []).map(function (c) { return c.id; });
+    lists.sort(function (a, b) { return (order.indexOf(a.category) - order.indexOf(b.category)) || ((b.recommended ? 1 : 0) - (a.recommended ? 1 : 0)); });
+    var last;
+    lists.forEach(function (l) {
+      if ((cat === 'all' || cat === 'recommended') && l.category !== last) {
+        var c = (catalog.categories || []).find(function (x) { return x.id === l.category; });
+        el.appendChild(make('h3', 'st-cat-head', c ? c.name : l.category)); last = l.category;
+      }
+      var added = isAdded(l.url), card = make('article', 'st-card' + (added ? ' is-added' : ''));
+      var title = make('div', 'st-card__title'), link = make('a', null, l.name);
+      link.href = l.homepage || l.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      title.appendChild(link);
+      var badges = make('div', 'st-card__badges');
+      if (l.recommended && cat !== 'recommended') badges.appendChild(make('span', 'pill pill-brand', 'Recommended'));
+      if (l.problematic) badges.appendChild(make('span', 'pill pill-warn', 'May break sites'));
+      var foot = make('div', 'st-card__foot');
+      if (added) foot.append(badges, make('span', 'pill pill-good', 'Added'));
+      else {
+        var add = make('button', 'btn btn-secondary btn-sm', '+ Add'); add.type = 'button';
+        add.onclick = function () { addList(l.name, l.url, add); };
+        foot.append(badges, add);
+      }
+      card.append(title, make('p', null, l.description || ''), foot); el.appendChild(card);
+    });
+  }
+
+  function addList(name, url, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Adding…'; }
+    return post('/api/blocklists/add', {name: name, url: url})
+      .then(function () { toast(name + ' added. Fetching domains in the background.'); load(); })
+      .catch(function (e) { toast('Could not add ' + name + ': ' + e.message, 'error'); if (btn) { btn.disabled = false; btn.textContent = '+ Add'; } throw e; });
+  }
+
+  $('custom-form').addEventListener('submit', function (e) {
+    e.preventDefault(); if (!this.reportValidity()) return;
+    var name = $('add-name').value.trim(), url = $('add-url').value.trim();
+    if (!/^https?:\/\//i.test(url)) { toast('List URLs must start with http:// or https://', 'error'); return; }
+    addList(name, url).then(function () { $('add-name').value = ''; $('add-url').value = ''; }).catch(function () {});
+  });
+  $('builtin-search').addEventListener('input', function (e) { term = e.target.value.trim().toLowerCase(); renderCatalog(); });
+  $('hide-added').addEventListener('change', renderCatalog);
+
+  $('refresh-all-btn').addEventListener('click', function () {
+    var btn = this;
+    if (!confirm('Re-fetch and re-parse every list, then flush the DNS cache?')) return;
+    btn.disabled = true; btn.textContent = 'Refreshing…';
+    post('/api/blocklists/refresh').then(function () { toast('Refresh started. Counts update as lists finish.', 'pending'); })
+      .catch(function (e) { toast('Refresh failed: ' + e.message, 'error'); })
+      .finally(function () { setTimeout(function () { btn.disabled = false; btn.textContent = 'Refresh all now'; load(); }, 5000); });
+  });
+
+  $('run-analysis-btn').addEventListener('click', function () {
+    var btn = this, el = $('analysis-results');
+    btn.disabled = true; btn.textContent = 'Analyzing…'; clear(el); el.appendChild(make('p', 'st-empty', 'Comparing lists…'));
+    api('/api/blocklists/analyze').then(renderAnalysis)
+      .catch(function (e) { clear(el); el.appendChild(make('p', 'st-empty error-state', 'Analysis failed: ' + e.message)); })
+      .finally(function () { btn.disabled = false; btn.textContent = 'Run again'; });
+  });
+
+  function block(title, hint) { var wrap = make('div', 'st-row'); var l = make('div', 'st-row__label'); l.append(make('h3', null, title), make('p', null, hint)); var c = make('div', 'st-row__control'); wrap.append(l, c); return {row: wrap, body: c}; }
+  function renderAnalysis(d) {
+    var el = $('analysis-results'); clear(el);
+    var lists = (d.lists || []).slice().sort(function (a, b) { return b.domains - a.domains; });
+    var unique = Number(d.total_unique || d.unique || 0), total = Number(d.total_with_dupes || 0);
+    var stats = make('dl', 'st-tiles');
+    [['Domains incl. duplicates', num(total)], ['Lists compared', lists.length]].concat(unique ? [['Unique domains', num(unique)]] : []).forEach(function (s) {
+      var t = make('div', 'st-tile'); t.append(make('dt', null, s[0]), make('dd', null, s[1])); stats.appendChild(t);
+    });
+    var summary = block('Summary', 'Overlap is measured on exact domain entries.'); summary.body.appendChild(stats); el.appendChild(summary.row);
+
+    var redundant = d.redundant || [];
+    var red = block('Redundant lists', redundant.length ? 'At least 90% of these lists is already covered by another list. Consider disabling them.' : 'No list is more than 90% covered by another.');
+    if (redundant.length) {
+      var box = make('div', 'st-endpoints'); box.style.maxWidth = 'none';
+      redundant.forEach(function (r) {
+        var f = make('div', 'st-finding'), pct = make('div', 'st-finding__pct', r.coverage_pct + '%'), txt = make('div');
+        var line = make('div'); line.append(make('strong', null, r.redundant_list), document.createTextNode(' is covered by '), make('strong', null, r.covered_by));
+        txt.append(line, make('p', null, num(r.redundant_domains) + ' domains, ' + num(r.covering_domains) + ' in the covering list'));
+        f.append(pct, txt); box.appendChild(f);
+      });
+      red.body.appendChild(box);
+    }
+    el.appendChild(red.row);
+
+    var overlaps = (d.overlaps || []).filter(function (o) { return o.pct_of_a_in_b >= 20 && o.pct_of_a_in_b < 90; }).sort(function (a, b) { return b.pct_of_a_in_b - a.pct_of_a_in_b; }).slice(0, 10);
+    if (overlaps.length) {
+      var ov = block('Significant overlap', 'Between 20% and 89% of one list also appears in another.'), ob = make('div', 'st-bars'); ob.style.padding = '0';
+      overlaps.forEach(function (o) {
+        var bar = make('div', 'st-bar'), name = make('div', 'st-bar__name', o.list_a + ' → ' + o.list_b), track = make('div', 'st-bar__track'), fill = make('div', 'st-bar__fill' + (o.pct_of_a_in_b >= 60 ? ' warn' : ''));
+        name.title = name.textContent; fill.style.width = o.pct_of_a_in_b + '%'; track.appendChild(fill);
+        bar.append(name, track, make('div', 'st-bar__value', o.pct_of_a_in_b + '% shared')); ob.appendChild(bar);
+      });
+      ov.body.appendChild(ob); el.appendChild(ov.row);
+    }
+
+    var sizes = block('List sizes', 'Relative size of each active list.'), sb = make('div', 'st-bars'); sb.style.padding = '0';
+    var max = lists.length ? lists[0].domains || 1 : 1;
+    lists.forEach(function (l) {
+      var bar = make('div', 'st-bar'), track = make('div', 'st-bar__track'), fill = make('div', 'st-bar__fill');
+      fill.style.width = Math.max(1, (l.domains || 0) / max * 100) + '%'; track.appendChild(fill);
+      bar.append(make('div', 'st-bar__name', l.name), track, make('div', 'st-bar__value', num(l.domains))); sb.appendChild(bar);
+    });
+    sizes.body.appendChild(sb); el.appendChild(sizes.row);
+  }
+
+  function load() {
+    return api('/api/blocklists').then(function (d) { active = d.blocklists || []; renderStats(); renderActive(); renderCatalog(); })
+      .catch(function () { var el = $('active-lists'); clear(el); el.appendChild(make('p', 'st-empty error-state', 'Could not load lists. Reload to retry.')); });
+  }
+  api('/api/blocklists/builtin').then(function (d) { catalog = d || catalog; renderChips(); renderCatalog(); }).catch(function () {});
+
+  load();
+})();
+</script>

@@ -1,0 +1,79 @@
+# ALTERNATIVE DNS service layer — anycast via BGP. NOT applied by default (it is
+# intentionally left out of kustomization.yaml). Use this INSTEAD OF the per-pod
+# LoadBalancers in service.yaml once your cluster can advertise anycast VIPs.
+#
+# ── Why this exists ────────────────────────────────────────────────────────────
+# The default (service.yaml) gives one LoadBalancer IP per pod, so a stub
+# resolver fails over IP-to-IP and a dead node only takes down its own IP. That
+# is correct everywhere but couples "number of DNS IPs" to "number of pods".
+#
+# Anycast breaks that coupling: advertise the SAME VIP from every healthy node
+# via BGP. The network routes each client to a healthy node and WITHDRAWS a
+# node's route within the BGP hold timer (sub-second to a few seconds) the moment
+# it goes unhealthy — so clients never send queries to a dead node and never mark
+# the shared VIP bad. This is how public resolvers serve the world on ~2 IPs.
+# Result: 2 stable IPs, N nodes, fast correct failover.
+#
+# ── Requirements (cluster-level, NOT managed here) ─────────────────────────────
+#   - MetalLB in BGP mode (or Cilium BGP), peered with your router/top-of-rack.
+#     L2/ARP mode does NOT give real anycast — it fails a whole VIP to one node.
+#   - externalTrafficPolicy: Local so a node only attracts traffic when it has a
+#     local Ready pod; combined with BGP route withdrawal this is what makes
+#     failover correct.
+#   - Bifrost pods are already anycast-safe: shared Postgres + replicated Mnesia +
+#     cluster-wide config propagation mean any pod answers any query identically.
+#
+# ── To switch ──────────────────────────────────────────────────────────────────
+#   1. Provision MetalLB BGP + a BGPAdvertisement/IPAddressPool for these VIPs.
+#   2. Set the two loadBalancerIP values below to your reserved anycast IPs.
+#   3. In kustomization.yaml, replace `service.yaml` with `service-anycast.yaml`.
+#   4. Keep bifrost-headless (still needed for cluster formation) and bifrost-web.
+#
+# Two VIPs (not one) so a client still has a second nameserver during rare
+# whole-network events; both are anycast across all pods.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-dns-anycast-a
+  namespace: bifrost
+  # annotations:                         # example MetalLB BGP pool selection
+  #   metallb.universe.tf/address-pool: bifrost-dns-anycast
+spec:
+  type: LoadBalancer
+  # loadBalancerIP: 198.51.100.53         # your reserved anycast VIP A
+  externalTrafficPolicy: Local           # required: only Ready-local nodes attract traffic
+  selector:
+    app: bifrost                         # all pods — anycast across the whole set
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-dns-anycast-b
+  namespace: bifrost
+  # annotations:
+  #   metallb.universe.tf/address-pool: bifrost-dns-anycast
+spec:
+  type: LoadBalancer
+  # loadBalancerIP: 198.51.100.54         # your reserved anycast VIP B
+  externalTrafficPolicy: Local
+  selector:
+    app: bifrost
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp

@@ -1,0 +1,9 @@
+## Node distribution. Dev (docker bridge) uses short names via the default
+## below. Kubernetes overrides BIFROST_DIST_NAME with a long name bound to the
+## pod FQDN, e.g. "-name bifrost@bifrost-0.bifrost-headless.default.svc.cluster.local".
+## RELX_REPLACE_OS_VARS=true (set in the release env) enables ${VAR} substitution.
+${BIFROST_DIST_NAME}
+-setcookie ${BIFROST_COOKIE}
++K true
++A 64
++P 65536

@@ -1,0 +1,106 @@
+# Headless service: gives each StatefulSet pod a stable DNS name
+# (bifrost-<ordinal>.bifrost-headless.bifrost.svc.cluster.local) used both for
+# Erlang distribution (long node names) and for seeding the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-headless
+  namespace: bifrost
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true   # peers must resolve each other before Ready
+  selector:
+    app: bifrost
+  ports:
+    - name: epmd
+      port: 4369
+    - name: erldist
+      port: 9100
+---
+# DNS services: ONE LoadBalancer (one stable external IP) PER pod, each selecting
+# exactly that pod via the StatefulSet's per-pod label. This is required for DNS
+# client failover semantics: a stub resolver treats each configured nameserver
+# IP as pass/fail — a single timeout marks that IP dead and it moves to the next.
+# If all N pods sat behind ONE VIP, a single pod failure would make clients see
+# the whole resolver as flaky and there would be no per-node failover. Instead,
+# list every per-pod IP as a separate nameserver (resolv.conf / router config);
+# the client fails over IP-to-IP. Scaling replicas => add a matching Service.
+#
+# externalTrafficPolicy: Local preserves the client source IP (needed for
+# per-client query stats) and guarantees the LB only targets its one local pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-dns-0
+  namespace: bifrost
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    statefulset.kubernetes.io/pod-name: bifrost-0
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-dns-1
+  namespace: bifrost
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    statefulset.kubernetes.io/pod-name: bifrost-1
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-dns-2
+  namespace: bifrost
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    statefulset.kubernetes.io/pod-name: bifrost-2
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+---
+# Web/API service: the UI + REST API. ClusterIP; front it with an Ingress or LB.
+# Safe to load-balance across pods — reads sum from shared Postgres and writes
+# propagate cluster-wide via the Mnesia config-reload bus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost-web
+  namespace: bifrost
+spec:
+  type: ClusterIP
+  selector:
+    app: bifrost
+  ports:
+    - name: web
+      port: 8081
+      targetPort: 8081

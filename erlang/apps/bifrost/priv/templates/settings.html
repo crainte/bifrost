@@ -1,0 +1,297 @@
+<div class="st-layout">
+  <form id="settings-form" class="st-main" novalidate>
+    <p class="page-intro">Changes are saved to PostgreSQL and applied live to every DNS node. Values marked <span class="pill pill-muted">Deployment</span> come from the ConfigMap; saving a different value creates an <span class="pill pill-violet">Override</span>.</p>
+
+    <!-- Upstreams -->
+    <section id="sec-upstreams" class="st-section" aria-labelledby="upstreams-title">
+      <header class="st-section__head">
+        <div><h2 id="upstreams-title">Default upstreams <span data-source="upstreams"></span></h2>
+          <p>Resolvers used for every query that does not match a conditional route.</p></div>
+        <div class="st-section__actions"><button type="button" class="btn btn-secondary btn-sm" data-reset="upstreams">Reset to deployment</button></div>
+      </header>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Resolution strategy</h3><p>How Bifrost picks a resolver on a cache miss.</p></div>
+        <div class="st-row__control">
+          <div class="st-choices" role="radiogroup" aria-label="Resolution strategy">
+            <label class="st-choice"><input type="radio" name="up-strategy" value="sequential"><strong>Sequential</strong><span>Round-robin with failover. Lowest upstream traffic.</span></label>
+            <label class="st-choice"><input type="radio" name="up-strategy" value="parallel"><strong>Parallel</strong><span>Ask every primary at once; first valid answer wins.</span></label>
+            <label class="st-choice"><input type="radio" name="up-strategy" value="fastest"><strong>Fastest resolver</strong><span>Prefer the resolver with the lowest observed latency.</span></label>
+          </div>
+        </div>
+      </div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Timing</h3><p>The total deadline covers every retry, fallback and TCP retry for one query.</p></div>
+        <div class="st-row__control"><div class="st-fields">
+          <label class="st-field"><span>Attempt timeout</span><div class="st-unit"><input id="up-timeout" type="number" min="100" max="10000" required><em>ms</em></div><small>100 – 10,000</small></label>
+          <label class="st-field"><span>Total deadline</span><div class="st-unit"><input id="up-deadline" type="number" min="100" max="30000" required><em>ms</em></div><small>Up to 30,000; at least the timeout</small></label>
+        </div></div>
+      </div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Primary resolvers</h3><p>Literal IPv4 or IPv6 addresses. Up to 8.</p></div>
+        <div class="st-row__control">
+          <div class="st-endpoints"><div class="st-endpoints__head"><span>Address</span><span>Port</span><span></span></div>
+            <div id="up-primary" class="st-endpoint-list" data-empty="At least one primary resolver is required."></div></div>
+          <button type="button" class="st-add" data-add="up-primary">+ Add primary resolver</button>
+        </div>
+      </div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Fallback resolvers</h3><p>Used only after every primary fails, times out or returns SERVFAIL. Optional.</p></div>
+        <div class="st-row__control">
+          <div class="st-endpoints"><div class="st-endpoints__head"><span>Address</span><span>Port</span><span></span></div>
+            <div id="up-fallback" class="st-endpoint-list" data-empty="No fallback resolvers configured."></div></div>
+          <button type="button" class="st-add" data-add="up-fallback">+ Add fallback resolver</button>
+          <div class="st-callout">Fallbacks may receive internal names and can bypass DNSSEC or filtering policy if they are configured differently from your primaries.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Conditional routes -->
+    <section id="sec-routes" class="st-section" aria-labelledby="routes-title">
+      <header class="st-section__head">
+        <div><h2 id="routes-title">Conditional forwarding <span data-source="routes"></span></h2>
+          <p>Send specific domains to dedicated resolvers. The most specific suffix wins, and a failed routed lookup never falls back to the default upstreams.</p></div>
+        <div class="st-section__actions"><button type="button" class="btn btn-secondary btn-sm" id="add-route">+ Add route</button><button type="button" class="btn btn-secondary btn-sm" data-reset="routes">Reset</button></div>
+      </header>
+      <p id="routes-empty" class="st-empty">No conditional routes. All queries use the default upstreams.</p>
+      <div id="routes" class="st-routes"></div>
+      <div class="st-preview">
+        <label class="st-field"><span>Test which resolvers a domain uses</span><input id="route-preview" class="form-field" placeholder="host.internal" autocomplete="off"></label>
+        <output id="route-result" aria-live="polite">Default upstreams</output>
+      </div>
+    </section>
+
+    <!-- Reverse DNS -->
+    <section id="sec-reverse" class="st-section" aria-labelledby="reverse-title">
+      <header class="st-section__head">
+        <div><h2 id="reverse-title">Reverse DNS <span data-source="reverse_dns"></span></h2>
+          <p>Private-range PTR queries are never sent to the default upstreams. Without private routing they receive a local NXDOMAIN.</p></div>
+        <div class="st-section__actions"><button type="button" class="btn btn-secondary btn-sm" data-reset="reverse_dns">Reset to deployment</button></div>
+      </header>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Features</h3><p>The two features are independent.</p></div>
+        <div class="st-row__control"><div class="st-switches">
+          <label class="st-switch"><input id="rdns-enrich" type="checkbox"><div><strong>Client-name enrichment</strong><span>Look up friendly names for client IPs shown in the UI.</span></div></label>
+          <label class="st-switch"><input id="rdns-route" type="checkbox"><div><strong>Route private PTR queries</strong><span>Forward clients' RFC1918 / ULA reverse lookups to the resolvers below.</span></div></label>
+        </div></div>
+      </div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Private resolvers</h3><p>Usually your router or gateway. Required when either feature is on.</p></div>
+        <div class="st-row__control">
+          <div class="st-endpoints"><div class="st-endpoints__head"><span>Address</span><span>Port</span><span></span></div>
+            <div id="rdns-resolvers" class="st-endpoint-list" data-empty="No private resolvers configured."></div></div>
+          <button type="button" class="st-add" data-add="rdns-resolvers">+ Add private resolver</button>
+        </div>
+      </div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Name cache</h3><p>How long client names are remembered before being looked up again.</p></div>
+        <div class="st-row__control"><div class="st-fields">
+          <label class="st-field"><span>Found names</span><div class="st-unit"><input id="rdns-positive" type="number" min="1" max="604800" required><em>sec</em></div></label>
+          <label class="st-field"><span>Missing names</span><div class="st-unit"><input id="rdns-negative" type="number" min="1" max="86400" required><em>sec</em></div></label>
+        </div></div>
+      </div>
+    </section>
+
+    <!-- Cache & blocking -->
+    <section id="sec-behavior" class="st-section" aria-labelledby="behavior-title">
+      <header class="st-section__head">
+        <div><h2 id="behavior-title">Cache &amp; blocking</h2>
+          <p>Non-IN DNS classes, including CHAOS identity queries such as <code>version.bind</code>, are always refused locally.</p></div>
+      </header>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Response cache <span data-source="cache"></span></h3><p>Zero entries disables caching. A positive minimum TTL can serve intentionally stale answers.</p></div>
+        <div class="st-row__control">
+          <div class="st-fields">
+            <label class="st-field"><span>Minimum TTL</span><div class="st-unit"><input id="cache-min" type="number" min="0" max="86400" required><em>sec</em></div></label>
+            <label class="st-field"><span>Maximum TTL</span><div class="st-unit"><input id="cache-max" type="number" min="0" max="604800" required><em>sec</em></div></label>
+            <label class="st-field"><span>Maximum entries</span><div class="st-unit"><input id="cache-entries" type="number" min="0" max="1000000" required><em>items</em></div></label>
+          </div>
+          <button type="button" class="st-add" data-reset="cache">Reset cache to deployment</button>
+        </div>
+      </div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Blocked response <span data-source="blocking"></span></h3><p>What clients receive for a blocked domain.</p></div>
+        <div class="st-row__control">
+          <div class="st-fields">
+            <label class="st-field"><span>Response</span><select id="block-mode" class="form-field"><option value="zero_ip">Zero IP (0.0.0.0 / ::)</option><option value="nxdomain">NXDOMAIN</option><option value="refused">REFUSED</option><option value="custom_ip">Custom IP</option></select></label>
+            <label class="st-field" id="block-ip-field"><span>Custom IP</span><input id="block-ip" class="form-field" placeholder="192.0.2.1" autocomplete="off"></label>
+          </div>
+          <button type="button" class="st-add" data-reset="blocking">Reset blocking to deployment</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- History -->
+    <section id="sec-history" class="st-section" aria-labelledby="history-title">
+      <header class="st-section__head"><div><h2 id="history-title">Query history</h2><p>How long the query log is kept in PostgreSQL.</p></div></header>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Retention</h3><p>Whole months. Zero keeps history forever.</p></div>
+        <div class="st-row__control">
+          <div class="st-fields"><label class="st-field"><span>Keep</span><div class="st-unit"><input id="retention" type="number" min="0" max="1200" required><em>months</em></div></label></div>
+          <div id="retention-note" class="st-callout info"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Status -->
+    <section id="sec-status" class="st-section" aria-labelledby="status-title">
+      <header class="st-section__head"><div><h2 id="status-title">Cluster status</h2><p>Whether every DNS node has applied the saved settings.</p></div></header>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th>Node</th><th>Status</th><th>Saved revision</th><th>Applied revision</th><th>Last error</th></tr></thead><tbody id="cluster-status"></tbody></table></div>
+      <div class="st-row">
+        <div class="st-row__label"><h3>Deployment settings</h3><p>Read-only. Change these in the ConfigMap; a restart is required.</p></div>
+        <div class="st-row__control"><dl id="structural" class="st-tiles"></dl></div>
+      </div>
+    </section>
+
+    <div id="savebar" class="st-savebar" role="region" aria-label="Save settings">
+      <div id="settings-status" class="st-savebar__status" role="status" aria-live="polite">Loading settings…</div>
+      <div class="st-savebar__actions"><button type="button" class="btn btn-secondary" id="cancel-settings">Discard changes</button><button type="submit" class="btn btn-primary" id="save-settings">Save settings</button></div>
+    </div>
+  </form>
+</div>
+<script>
+(function () {
+  var current, original, resets = {}, dirty = false;
+  var form = document.getElementById('settings-form'), status = document.getElementById('settings-status'), bar = document.getElementById('savebar');
+  var STRATEGIES = [['sequential', 'Sequential'], ['parallel', 'Parallel'], ['fastest', 'Fastest resolver']];
+  function $(id) { return document.getElementById(id); }
+  function text(el, v) { el.textContent = v == null ? '' : String(v); }
+  function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+  function make(tag, cls, v) { var e = document.createElement(tag); if (cls) e.className = cls; if (v != null) text(e, v); return e; }
+  function field(label, input, unit) {
+    var l = make('label', 'st-field'); l.appendChild(make('span', null, label));
+    if (unit) { var u = make('div', 'st-unit'); u.append(input, make('em', null, unit)); l.appendChild(u); } else l.appendChild(input);
+    return l;
+  }
+  function endpointRow(list, v) {
+    var row = make('div', 'endpoint-row'), a = make('input', 'form-field'), p = make('input', 'form-field'), rm = make('button', 'st-icon-btn', '×');
+    a.value = v ? v.address : ''; a.placeholder = '192.0.2.53'; a.required = true; a.autocomplete = 'off'; a.setAttribute('aria-label', 'Resolver address');
+    p.type = 'number'; p.min = 1; p.max = 65535; p.required = true; p.value = v ? v.port : 53; p.setAttribute('aria-label', 'Port');
+    rm.type = 'button'; rm.title = 'Remove'; rm.setAttribute('aria-label', 'Remove resolver');
+    rm.onclick = function () { row.remove(); markDirty(); };
+    row.append(a, p, rm); list.appendChild(row);
+    return a;
+  }
+  function endpointBlock(title, cls, values, empty, addLabel) {
+    var wrap = make('div'), box = make('div', 'st-endpoints'), head = make('div', 'st-endpoints__head'), list = make('div', 'st-endpoint-list ' + cls), add = make('button', 'st-add', addLabel);
+    ['Address', 'Port', ''].forEach(function (h) { head.appendChild(make('span', null, h)); });
+    list.dataset.empty = empty; (values || []).forEach(function (e) { endpointRow(list, e); });
+    add.type = 'button'; add.onclick = function () { endpointRow(list).focus(); markDirty(); };
+    box.append(head, list); wrap.append(make('h4', null, title), box, add); add.style.marginTop = '8px';
+    return wrap;
+  }
+  function setEndpoints(id, values) { var c = $(id); clear(c); (values || []).forEach(function (v) { endpointRow(c, v); }); }
+  function getEndpoints(c) { return Array.prototype.map.call(c.querySelectorAll('.endpoint-row'), function (r) { var i = r.querySelectorAll('input'); return {address: i[0].value.trim(), port: Number(i[1].value)}; }); }
+  function routeCard(route) {
+    var card = make('div', 'route-card'), head = make('div', 'route-card__head'), body = make('div', 'route-card__body');
+    var id = make('input', 'form-field route-id'), domains = make('input', 'form-field route-domains'), remove = make('button', 'btn btn-danger btn-sm', 'Remove route');
+    id.value = route.id; id.required = true; id.autocomplete = 'off';
+    domains.value = route.domains.join(', '); domains.required = true; domains.placeholder = 'internal, corp.example'; domains.autocomplete = 'off';
+    remove.type = 'button'; remove.onclick = function () { if (confirm('Remove route "' + id.value + '"?')) { card.remove(); syncRoutesEmpty(); markDirty(); } };
+    head.append(field('Route name', id), field('Domain suffixes (comma-separated)', domains), remove);
+    var strategy = make('select', 'form-field route-strategy');
+    STRATEGIES.forEach(function (s) { var o = make('option', null, s[1]); o.value = s[0]; strategy.appendChild(o); });
+    strategy.value = route.strategy;
+    var timeout = make('input', 'route-timeout'), deadline = make('input', 'route-deadline');
+    timeout.type = deadline.type = 'number'; timeout.min = 100; timeout.max = 10000; deadline.min = 100; deadline.max = 30000;
+    timeout.value = route.timeout_ms; deadline.value = route.deadline_ms; timeout.required = deadline.required = true;
+    var fields = make('div', 'st-fields'); fields.append(field('Strategy', strategy), field('Attempt timeout', timeout, 'ms'), field('Total deadline', deadline, 'ms'));
+    var pair = make('div', 'st-pair');
+    pair.append(endpointBlock('Primary resolvers', 'route-primary', route.primary, 'At least one primary resolver is required.', '+ Add primary'),
+                endpointBlock('Isolated fallbacks', 'route-fallback', route.fallback, 'No fallbacks. Failures return SERVFAIL.', '+ Add fallback'));
+    body.append(fields, pair); card.append(head, body); $('routes').appendChild(card); syncRoutesEmpty();
+    return id;
+  }
+  function syncRoutesEmpty() { $('routes-empty').classList.toggle('st-hidden', $('routes').children.length > 0); }
+  function syncBlockIp() { $('block-ip-field').classList.toggle('st-hidden', $('block-mode').value !== 'custom_ip'); }
+  function populate(data) {
+    current = data; original = JSON.parse(JSON.stringify(data.settings)); resets = {}; dirty = false;
+    var s = data.settings, up = s.upstreams;
+    (form.querySelector('input[name=up-strategy][value="' + up.strategy + '"]') || {}).checked = true;
+    $('up-timeout').value = up.timeout_ms; $('up-deadline').value = up.deadline_ms;
+    setEndpoints('up-primary', up.primary); setEndpoints('up-fallback', up.fallback);
+    clear($('routes')); s.routes.forEach(routeCard); syncRoutesEmpty();
+    $('rdns-enrich').checked = s.reverse_dns.enrichment_enabled; $('rdns-route').checked = s.reverse_dns.route_private_ptr;
+    $('rdns-positive').value = s.reverse_dns.positive_ttl_seconds; $('rdns-negative').value = s.reverse_dns.negative_ttl_seconds;
+    setEndpoints('rdns-resolvers', s.reverse_dns.resolvers);
+    $('cache-min').value = s.cache.min_ttl; $('cache-max').value = s.cache.max_ttl; $('cache-entries').value = s.cache.max_entries;
+    $('block-mode').value = s.blocking.mode; $('block-ip').value = s.blocking.custom_ip; syncBlockIp();
+    $('retention').value = s.retention_months;
+    document.querySelectorAll('[data-source]').forEach(function (el) { var o = data.sources[el.dataset.source] === 'postgres'; el.className = 'pill ' + (o ? 'pill-violet' : 'pill-muted'); text(el, o ? 'Override' : 'Deployment'); });
+    text($('retention-note'), (s.retention_months === 0 ? 'History is kept forever. ' : '') + data.retention_effect);
+    renderCluster(data.cluster); renderStructural(data.structural); updateStatus();
+  }
+  function collect() {
+    var strategy = form.querySelector('input[name=up-strategy]:checked');
+    return {schema_version: 1,
+      upstreams: {primary: getEndpoints($('up-primary')), fallback: getEndpoints($('up-fallback')), strategy: strategy ? strategy.value : 'sequential', timeout_ms: Number($('up-timeout').value), deadline_ms: Number($('up-deadline').value)},
+      routes: Array.prototype.map.call(document.querySelectorAll('.route-card'), function (c) {
+        return {id: c.querySelector('.route-id').value.trim(), domains: c.querySelector('.route-domains').value.split(',').map(function (x) { return x.trim(); }).filter(Boolean),
+          primary: getEndpoints(c.querySelector('.route-primary')), fallback: getEndpoints(c.querySelector('.route-fallback')),
+          strategy: c.querySelector('.route-strategy').value, timeout_ms: Number(c.querySelector('.route-timeout').value), deadline_ms: Number(c.querySelector('.route-deadline').value)};
+      }),
+      cache: {min_ttl: Number($('cache-min').value), max_ttl: Number($('cache-max').value), max_entries: Number($('cache-entries').value)},
+      blocking: {mode: $('block-mode').value, custom_ip: $('block-mode').value === 'custom_ip' ? $('block-ip').value.trim() : ''},
+      reverse_dns: {enrichment_enabled: $('rdns-enrich').checked, route_private_ptr: $('rdns-route').checked, resolvers: getEndpoints($('rdns-resolvers')), positive_ttl_seconds: Number($('rdns-positive').value), negative_ttl_seconds: Number($('rdns-negative').value)},
+      retention_months: Number($('retention').value)};
+  }
+  function renderCluster(nodes) {
+    var body = $('cluster-status'); clear(body);
+    (nodes || []).forEach(function (n) {
+      var tr = make('tr'), st = make('td'), badge = make('span', 'pill ' + (n.state === 'applied' ? 'pill-good' : n.state === 'offline' ? 'pill-danger' : 'pill-warn'), n.state || 'unknown');
+      st.appendChild(badge);
+      tr.append(make('td', 'font-mono', n.node), st, make('td', null, n.desired_revision == null ? '—' : n.desired_revision), make('td', null, n.applied_revision == null ? '—' : n.applied_revision), make('td', null, n.last_error || '—'));
+      body.appendChild(tr);
+    });
+  }
+  function renderStructural(s) {
+    var dl = $('structural'); clear(dl);
+    [['Listen address', s.listen_address + ':' + s.listen_port], ['Client ACL', s.allowed_clients.length ? s.allowed_clients.join(', ') : 'All clients'], ['Cluster discovery', s.discovery], ['Source', s.config_source]].forEach(function (x) {
+      var t = make('div', 'st-tile'); t.append(make('dt', null, x[0]), make('dd', null, x[1])); dl.appendChild(t);
+    });
+  }
+  function updateStatus(message, kind) {
+    var states = (current && current.cluster || []).map(function (n) { return n.state; });
+    var allApplied = states.length && states.every(function (s) { return s === 'applied'; });
+    kind = kind || (dirty ? 'dirty' : allApplied ? '' : 'pending');
+    text(status, message || (dirty ? 'You have unsaved changes.' : allApplied ? 'All changes applied on every node.' : 'Saved. Waiting for some nodes to apply.'));
+    bar.className = 'st-savebar ' + kind;
+  }
+  function markDirty() { dirty = true; updateStatus(); }
+  function load() { return fetch('/api/settings', {cache: 'no-store'}).then(function (r) { if (!r.ok) throw r; return r.json(); }).then(populate).catch(function () { updateStatus('Settings unavailable. Reload to retry.', 'error'); }); }
+
+  form.addEventListener('input', markDirty);
+  form.addEventListener('change', function (e) { if (e.target.id === 'block-mode') syncBlockIp(); markDirty(); });
+  document.querySelectorAll('[data-add]').forEach(function (b) { b.onclick = function () { endpointRow($(b.dataset.add)).focus(); markDirty(); }; });
+  $('add-route').onclick = function () { routeCard({id: 'route-' + ($('routes').children.length + 1), domains: [], primary: [{address: '', port: 53}], fallback: [], strategy: 'sequential', timeout_ms: 2000, deadline_ms: 6000}).focus(); markDirty(); };
+  document.querySelectorAll('[data-reset]').forEach(function (b) {
+    b.onclick = function () {
+      var section = b.dataset.reset;
+      if (!confirm('Reset this section to the deployment defaults? The change takes effect when you save.')) return;
+      var next = collect(); next[section] = current.defaults[section]; current.settings = next;
+      populate(current); resets[section] = true; dirty = true; updateStatus('Reset staged. Save to apply it.');
+    };
+  });
+  $('cancel-settings').onclick = function () { if (!dirty || confirm('Discard unsaved changes?')) load(); };
+  $('route-preview').addEventListener('input', function (e) {
+    var name = e.target.value.trim().toLowerCase().replace(/\.$/, ''), best = null;
+    collect().routes.forEach(function (r) { r.domains.forEach(function (d) { d = d.toLowerCase().replace(/\.$/, ''); if (name && (name === d || name.endsWith('.' + d)) && (!best || d.length > best.domain.length)) best = {id: r.id, domain: d}; }); });
+    text($('route-result'), best ? 'Route "' + best.id + '" (matched ' + best.domain + ')' : 'Default upstreams');
+  });
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!form.reportValidity()) return;
+    var next = collect();
+    if (next.retention_months > 0 && (original.retention_months === 0 || next.retention_months < original.retention_months) && !confirm('Shorter retention deletes older months during the next monthly maintenance. Continue?')) return;
+    $('save-settings').disabled = true; updateStatus('Saving…', 'pending');
+    fetch('/api/settings', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({revision: current.revision, settings: next, reset: Object.keys(resets)})})
+      .then(function (r) { return r.json().then(function (b) { if (!r.ok) throw {status: r.status, body: b}; return b; }); })
+      .then(function () { dirty = false; return load().then(function () { updateStatus('Saved. Applying on every node…', 'pending'); }); })
+      .catch(function (err) { updateStatus(err.status === 409 ? 'Settings were changed in another session. Discard and reload before saving.' : 'Could not save: ' + ((err.body && (err.body.field || err.body.message || err.body.error)) || 'request failed'), 'error'); })
+      .finally(function () { $('save-settings').disabled = false; });
+  });
+  window.addEventListener('beforeunload', function (e) { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+
+  load();
+  setInterval(function () { if (!dirty) load(); }, 10000);
+})();
+</script>

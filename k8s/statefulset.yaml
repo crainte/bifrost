@@ -1,0 +1,196 @@
+# Bifrost DNS cluster. StatefulSet gives stable, ordinal pod identities
+# (bifrost-0..N) with resolvable per-pod DNS via the headless service — required
+# for Erlang long-name distribution and Mnesia cluster formation.
+#
+# Single container per pod: Erlang is PID 1 and spawns the Rust hot-path binary
+# via a port. Kubernetes only ever restarts the whole pod; OTP supervises Rust.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bifrost
+  namespace: bifrost
+  annotations:
+    # Reloader (Stakater) restarts pods when the ConfigMap/Secret changes.
+    configmap.reloader.stakater.com/reload: "bifrost-config"
+    secret.reloader.stakater.com/reload: "bifrost-secrets"
+spec:
+  serviceName: bifrost-headless
+  replicas: 3
+  podManagementPolicy: Parallel      # form the cluster fast; join is boot-order safe
+  selector:
+    matchLabels:
+      app: bifrost
+  template:
+    metadata:
+      labels:
+        app: bifrost
+    spec:
+      terminationGracePeriodSeconds: 30
+      # Spread DNS replicas across nodes: one node failing must not take more
+      # than one per-pod DNS IP with it. Preferred, not required, so a small
+      # cluster with fewer nodes than replicas can still schedule them all.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: bifrost
+      # Fully unprivileged. DNS binds high port 5454; the Service remaps 53->5454.
+      # fsGroup makes the Mnesia PVC group-owned by 65534 so the runtime user can
+      # write disc_copies. No capabilities and no root anywhere in the pod.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bifrost
+          image: ghcr.io/crainte/bifrost:0.1.0  # bumped by the Release workflow; pin a digest if you prefer
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: dns-udp
+              containerPort: 5454
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 5454
+              protocol: TCP
+            - name: web
+              containerPort: 8081
+            - name: epmd
+              containerPort: 4369
+            - name: erldist
+              containerPort: 9100
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BIFROST_CONFIG_PATH
+              value: /etc/bifrost/config.yaml
+            - name: BIFROST_RUST_BIN
+              value: /usr/local/bin/bifrost-resolver
+            - name: BIFROST_LISTEN_ADDR
+              value: 0.0.0.0:5454
+            # Long-name distribution bound to this pod's stable FQDN.
+            - name: BIFROST_DIST_NAME
+              value: "-name bifrost@$(POD_NAME).bifrost-headless.$(POD_NAMESPACE).svc.cluster.local"
+            # Fixed Erlang distribution port so it can be exposed/firewalled.
+            - name: ERL_DIST_PORT
+              value: "9100"
+            - name: BIFROST_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: bifrost-secrets
+                  key: BIFROST_COOKIE
+            - name: BIFROST_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bifrost-secrets
+                  key: BIFROST_DB_PASSWORD
+            - name: BIFROST_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: bifrost-secrets
+                  key: BIFROST_SESSION_SECRET
+            - name: BIFROST_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: bifrost-secrets
+                  key: BIFROST_ADMIN_USER
+            - name: BIFROST_ADMIN_PASSWORD_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: bifrost-secrets
+                  key: BIFROST_ADMIN_PASSWORD_HASH
+            # Peers are DISCOVERED from the headless Service's SRV records, so
+            # scaling replicas needs no change here. (The alternative,
+            # BIFROST_CLUSTER_NODES, takes precedence if you ever need to pin an
+            # explicit list — that is what docker-compose uses.)
+            # Requires publishNotReadyAddresses on bifrost-headless, already set,
+            # or pods cannot resolve each other before they are Ready.
+            - name: BIFROST_CLUSTER_SERVICE
+              value: bifrost-headless.$(POD_NAMESPACE).svc.cluster.local
+            - name: RUST_LOG
+              value: bifrost_resolver=info
+          volumeMounts:
+            - name: config
+              mountPath: /etc/bifrost
+              readOnly: true
+            - name: mnesia
+              mountPath: /var/lib/bifrost/mnesia
+          # Probes MUST target auth-exempt paths. /api/cluster is gated and
+          # returns 401 unauthenticated, which is outside the 200-399 success
+          # range — pointing startup/liveness at it means the pod never becomes
+          # ready and CrashLoopBackOffs as soon as auth is configured.
+          #
+          # Liveness: is the BEAM answering? No DB, no hydration dependency, so
+          # a Postgres blip or a slow first blocklist fetch cannot kill the pod.
+          startupProbe:
+            httpGet:
+              path: /api/health/live
+              port: 8081
+            periodSeconds: 5
+            failureThreshold: 24        # up to 120s for a slow start
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: 8081
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          # Readiness gates Service membership on this pod being able to ANSWER:
+          # blocklists hydrated into Rust. Until Rust gets reload_complete it
+          # SERVFAILs every query, so a pod that is Ready too early (or that lost
+          # its Rust process) would black-hole DNS. It deliberately does NOT
+          # depend on Postgres: every pod shares it, so a DB stall would mark all
+          # pods NotReady at once and take every DNS IP out together.
+          # failureThreshold is generous because hydration re-runs on any Rust
+          # restart and can take a minute or two on large lists.
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8081
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Sized from MEASUREMENT, not guesswork (dev cluster, 13 lists, ~3.4M
+          # domains incl. one 2.4M-domain list): ~600-900MiB at rest, and a
+          # forced refresh of every list peaked at 1.8GiB of process memory
+          # (Rust ~430MiB; the rest is the BEAM holding several transient
+          # copies of the largest list while it is parsed, cached in Mnesia,
+          # written to the disc log and pushed to Rust). The old 1Gi limit would
+          # OOM-kill a pod mid-refresh. Re-measure if you add very large lists.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "1Gi"
+            limits:
+              memory: "2560Mi"
+      volumes:
+        - name: config
+          configMap:
+            name: bifrost-config
+  # Mnesia is disc_copies for blocklist_cache; a small PVC per pod persists the
+  # schema + cache across restarts so a rolling restart doesn't refetch lists.
+  volumeClaimTemplates:
+    - metadata:
+        name: mnesia
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

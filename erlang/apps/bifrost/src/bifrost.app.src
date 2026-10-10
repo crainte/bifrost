@@ -1,0 +1,18 @@
+{application, bifrost, [
+    {description, "Bifrost DNS — control plane"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {bifrost_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        inets,
+        ssl,
+        cowboy,
+        jsx,
+        epgsql
+    ]},
+    {env, []},
+    {modules, []}
+]}.

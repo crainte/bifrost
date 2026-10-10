@@ -1,0 +1,111 @@
+<div class="health-strip" role="status"><span id="readiness-state" class="badge unknown">Checking DNS readiness</span><span id="operation-details">Connecting to this node…</span></div>
+<div class="metric-band" id="stats-cards">
+  <div class="metric"><div class="metric-label">Queries / second</div><div id="stat-qps" class="metric-value">—</div><div class="metric-note">Last 60 seconds</div></div>
+  <div class="metric"><div class="metric-label">Queries</div><div id="stat-total" class="metric-value">—</div><div class="metric-note">Last 90 days</div></div>
+  <div class="metric"><div class="metric-label">Cache ratio</div><div id="stat-cached" class="metric-value tone-cache">—</div><div class="metric-note">Last 90 days · served locally</div></div>
+  <div class="metric"><div class="metric-label">Block ratio</div><div id="stat-blocked" class="metric-value tone-block">—</div><div class="metric-note">Last 90 days · policy decisions</div></div>
+  <div class="metric"><div class="metric-label">Negative / error answers</div><div id="stat-errors" class="metric-value tone-warning">—</div><div class="metric-note">90 days · NXDOMAIN, SERVFAIL, REFUSED, unknown</div></div>
+</div>
+<div class="overview-charts">
+  <section class="section-card"><div class="section-head"><div><h2 class="section-title">Query traffic</h2><p class="section-kicker">Last 24 hours · five-minute buckets</p></div><a href="/query-log">Explore queries →</a></div><div class="chart-frame"><canvas id="trends-chart" aria-label="Non-blocked and blocked query volume" role="img"></canvas></div><p id="chart-status" class="section-kicker" role="status">Loading traffic history…</p></section>
+  <section class="section-card"><div class="section-head"><div><h2 class="section-title">DNS decisions</h2><p class="section-kicker">Last 90 days</p></div></div><div class="chart-frame chart-frame-small"><canvas id="query-chart" aria-label="DNS decision counts" role="img"></canvas></div><div id="decision-list">Loading decisions…</div></section>
+</div>
+<div class="overview-rankings">
+  <section class="section-card"><div class="section-head"><h2 class="section-title">Blocked domains</h2><a href="/query-log?action=BIFROST_BLOCK">Inspect →</a></div><div id="top-blocked">Loading…</div></section>
+  <section class="section-card"><div class="section-head"><h2 class="section-title">Queried domains</h2><a href="/query-log">Inspect →</a></div><div id="top-queried">Loading…</div></section>
+  <section class="section-card"><div class="section-head"><h2 class="section-title">Active clients</h2><a href="/clients">Inspect →</a></div><div id="top-clients">Loading…</div></section>
+</div>
+<div class="overview-pair">
+  <section class="section-card"><div class="section-head"><div><h2 class="section-title">Upstream resolvers</h2><p class="section-kicker">Current DNS probe results</p></div></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Endpoint</th><th>Latency</th><th>Health</th></tr></thead><tbody id="upstream-list"><tr><td colspan="3">Loading…</td></tr></tbody></table></div></section>
+  <section class="section-card"><div class="section-head"><h2 class="section-title">Active blocklists</h2><a href="/blocklists">Manage →</a></div><div class="table-wrap"><table class="data-table"><thead><tr><th>Source</th><th>Domains</th></tr></thead><tbody id="list-summary"><tr><td colspan="2">Loading…</td></tr></tbody></table></div></section>
+</div>
+<section class="section-card"><div class="section-head"><div><h2 class="section-title">Cluster & background jobs</h2><p class="section-kicker">Connected nodes and work ownership</p></div><span id="cl-this" class="section-kicker">—</span></div><div id="cluster-body">Loading cluster…</div></section>
+<script>
+(function() {
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) {
+      return {'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c];
+    });
+  }
+  function n(value) { return Number(value || 0); }
+  async function get(url) {
+    var response = await fetch(url);
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    return response.json();
+  }
+  function badge(status) {
+    return '<span class="badge ' + (status === 'up' ? 'good' : status === 'down' ? 'bad' : 'unknown') + '">' + esc(status) + '</span>';
+  }
+  function ranked(id, items, key, href, tone) {
+    var el = document.getElementById(id);
+    if (!items || !items.length) { el.innerHTML = '<div class="empty-state">No queries in this window.</div>'; return; }
+    var maximum = Math.max.apply(null, items.map(function(x) { return n(x.count); }));
+    el.innerHTML = items.slice(0, 10).map(function(x) {
+      return '<div class="rank-row"><div><a class="font-mono" href="' + href(x) + '">' + esc(x[key]) + '</a><span>' + n(x.count).toLocaleString() + '</span></div><div class="rank-track"><span class="' + tone + '" style="width:' + (maximum ? n(x.count) / maximum * 100 : 0) + '%"></span></div></div>';
+    }).join('');
+  }
+  var trafficChart, decisionChart;
+  var labels = [];
+  var end = Math.floor(Date.now() / 300000) * 300000;
+  for (var i = 287; i >= 0; i--) labels.push(new Date(end - i * 300000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  if (typeof Chart !== 'undefined') {
+    Chart.defaults.color = '#a7b3c8';
+    Chart.defaults.borderColor = 'rgba(130,144,170,.12)';
+    Chart.defaults.font.family = 'Inter, system-ui, sans-serif';
+    trafficChart = new Chart(document.getElementById('trends-chart'), {
+      type: 'line',
+      data: {labels: labels, datasets: [
+        {label: 'Non-blocked', data: labels.map(function() { return null; }), borderColor: '#75a7ff', backgroundColor: 'rgba(117,167,255,.09)', fill:true, pointRadius:0, borderWidth:2, tension:.25},
+        {label: 'Blocked', data: labels.map(function() { return null; }), borderColor: '#f472b6', backgroundColor: 'rgba(244,114,182,.08)', fill:true, pointRadius:0, borderWidth:2, tension:.25}
+      ]},
+      options: {responsive:true, maintainAspectRatio:false, interaction:{intersect:false,mode:'index'}, plugins:{legend:{position:'bottom',labels:{usePointStyle:true,boxWidth:8,padding:20}}}, scales:{x:{ticks:{maxTicksLimit:8},grid:{display:false}},y:{beginAtZero:true,suggestedMax:5,ticks:{precision:0}}}}
+    });
+    decisionChart = new Chart(document.getElementById('query-chart'), {
+      type:'bar', data:{labels:['Blocked','Cached','Forwarded','Rewritten','Allowed','Negative / Error'],datasets:[{data:[0,0,0,0,0,0],backgroundColor:['#f472b6','#45d5e8','#75a7ff','#a78bfa','#69d4ad','#efc477'],borderRadius:3}]},
+      options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,suggestedMax:5,ticks:{precision:0}},y:{grid:{display:false}}}}
+    });
+  } else {
+    document.getElementById('chart-status').textContent = 'Chart library unavailable. Check access to the chart CDN.';
+  }
+  get('/api/stats/trends').then(function(t) {
+    var rows = t.trends || [];
+    if (trafficChart && rows.length) {
+      trafficChart.data.labels = rows.map(function(x) { return new Date(x.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); });
+      trafficChart.data.datasets[0].data = rows.map(function(x) { return n(x.queries); });
+      trafficChart.data.datasets[1].data = rows.map(function(x) { return n(x.blocked); });
+      trafficChart.update();
+    }
+    if (trafficChart) document.getElementById('chart-status').textContent = rows.length ? 'Non-blocked traffic and policy blocks are shown separately.' : 'No recorded queries in the last 24 hours. Historical totals may still appear below.';
+  }).catch(function() { document.getElementById('chart-status').textContent = 'Traffic history unavailable. The chart is waiting for data.'; });
+  get('/api/health').then(function(d) {
+    var ready = document.getElementById('readiness-state');
+    ready.className = 'badge ' + (d.status === 'ok' ? 'good' : 'unknown');
+    ready.textContent = d.status === 'ok' ? 'DNS ready' : 'Hydrating';
+    document.getElementById('operation-details').textContent = d.db ? 'State loaded · Database connected' : 'State loaded · Database unavailable';
+  }).catch(function() { document.getElementById('readiness-state').textContent = 'Readiness unconfirmed'; document.getElementById('operation-details').textContent = 'This node may still be hydrating.'; });
+  get('/api/stats').then(function(d) {
+    var values = [d.blocked,d.cached,d.forwarded,d.rewritten,d.allowed,d.upstream_errors].map(n);
+    var total = values.reduce(function(a,b) { return a+b; },0);
+    document.getElementById('stat-total').textContent = total.toLocaleString();
+    document.getElementById('stat-qps').textContent = d.qps == null ? '—' : n(d.qps).toFixed(1);
+    document.getElementById('stat-cached').textContent = total ? (n(d.cached)/total*100).toFixed(1)+'%' : '—';
+    document.getElementById('stat-blocked').textContent = total ? (n(d.blocked)/total*100).toFixed(1)+'%' : '—';
+    document.getElementById('stat-errors').textContent = n(d.upstream_errors).toLocaleString();
+    if (decisionChart) { decisionChart.data.datasets[0].data = values; decisionChart.update(); }
+    document.getElementById('decision-list').innerHTML = '<p class="section-kicker">Negative / error answers include NXDOMAIN; they do not necessarily indicate an unhealthy resolver.</p>';
+    ranked('top-blocked',d.blocked_domains,'domain',function(x) { return '/query-log?search='+encodeURIComponent(x.domain)+'&action=BIFROST_BLOCK'; },'rank-block');
+    ranked('top-queried',d.queried_domains,'domain',function(x) { return '/query-log?search='+encodeURIComponent(x.domain); },'rank-query');
+    ranked('top-clients',d.top_clients,'ip',function(x) { return '/clients?ip='+encodeURIComponent(x.ip); },'rank-client');
+    document.getElementById('list-summary').innerHTML = (d.blocklists||[]).map(function(x) { return '<tr><td>'+esc(x.name)+'</td><td>'+n(x.domains).toLocaleString()+'</td></tr>'; }).join('') || '<tr><td colspan="2">No active lists</td></tr>';
+    document.getElementById('upstream-list').innerHTML = (d.upstreams||[]).map(function(x) { return '<tr><td class="font-mono">'+esc(x.address)+':'+n(x.port)+'</td><td>'+(x.latency_ms == null ? '—' : n(x.latency_ms)+' ms')+'</td><td>'+badge(x.status||'unknown')+'</td></tr>'; }).join('') || '<tr><td colspan="3">No upstreams configured</td></tr>';
+  }).catch(function() {
+    ['decision-list','top-blocked','top-queried','top-clients'].forEach(function(id) { document.getElementById(id).innerHTML = '<p class="error-state">Statistics unavailable. Reload to retry.</p>'; });
+  });
+  get('/api/cluster').then(function(d) {
+    document.getElementById('cl-this').textContent = d.this_node || '—';
+    var nodes = (d.nodes||[]).map(function(x) { return '<tr><td class="font-mono">'+esc(x.name)+(x.self?' <span class="section-kicker">this node</span>':'')+'</td><td>'+badge(x.status||'unknown')+'</td><td>'+(x.leader?'Leader':'Peer')+'</td></tr>'; }).join('');
+    var jobs = (d.jobs||[]).map(function(j) { return '<div class="job-row"><div><strong>'+esc(j.name)+'</strong><p class="section-kicker">'+esc(j.scope)+' · '+esc(j.coordination||'')+'</p></div><span class="font-mono">'+esc(j.status||j.leader||'Awaiting first tick')+'</span></div>'; }).join('');
+    document.getElementById('cluster-body').innerHTML = '<div class="cluster-summary"><span class="badge '+(d.db_ok?'good':'bad')+'">Database '+(d.db_ok?'connected':'unavailable')+'</span><span>'+n(d.node_count)+' connected nodes</span></div><div class="overview-pair"><div class="table-wrap"><table class="data-table"><thead><tr><th>Node</th><th>Status</th><th>Role</th></tr></thead><tbody>'+nodes+'</tbody></table></div><div>'+jobs+'</div></div>';
+  }).catch(function() { document.getElementById('cluster-body').innerHTML = '<p class="error-state">Cluster status unavailable. Reload to retry.</p>'; });
+})();
+</script>

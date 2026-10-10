@@ -1,0 +1,35 @@
+# Structural config (GitOps source of truth). Erlang reads this once at startup;
+# operational changes go through the UI -> Postgres. Reloader watches this CM and
+# triggers a rolling restart on change (annotation on the StatefulSet).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bifrost-config
+  namespace: bifrost
+data:
+  config.yaml: |
+    %% Deployment defaults for live DNS settings. Explicit Settings-page
+    %% overrides are stored in PostgreSQL and take precedence without restart.
+    {upstreams, [[{address, "192.0.2.10"}, {port, 53}], [{address, "192.0.2.11"}, {port, 53}]]}.
+    {cache, [{max_ttl, 3600}, {min_ttl, 60}, {max_entries, 100000}]}.
+    {blocklists, {default, [
+        [{name, "hagezi-pro"}, {url, "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.txt"}, {enabled, true}],
+        [{name, "oisd-big"}, {url, "https://big.oisd.nl/domainswild"}, {enabled, true}]
+    ]}}.
+    {network, [{listen_address, "0.0.0.0"}, {listen_port, 5454}, {unix_socket_path, "/run/bifrost/ipc.sock"}
+               %% Optional client allowlist (CIDRs or single addresses). Unset =
+               %% anyone who can reach the DNS IPs may query: set it if those IPs
+               %% could ever be reachable from outside your network (an open
+               %% resolver gets abused for amplification attacks). Remember your
+               %% IPv6 prefix: home clients often have global IPv6 addresses.
+               %% An entry that does not parse is skipped; if NONE parse, every
+               %% client is refused (fails closed rather than open).
+               %% , {allowed_clients, ["10.0.0.0/8", "192.168.0.0/16", "fd00::/8"]}
+              ]}.
+    %% Optional reverse-DNS (PTR) resolver for friendly client names. Set to the
+    %% LAN gateway that owns the reverse zone; leave unset to disable PTR.
+    %% {ptr_resolver, "192.0.2.1"}.
+    {blocking, [{mode, zero_ip}, {custom_ip, ""}]}.
+    %% NOTE: no password here. It is injected at runtime from the bifrost-secrets
+    %% Secret via the BIFROST_DB_PASSWORD env var (see statefulset.yaml).
+    {database, [{host, "postgres.bifrost.svc.cluster.local"}, {port, 5432}, {name, "bifrost"}, {user, "bifrost"}]}.

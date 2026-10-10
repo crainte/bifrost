@@ -1,0 +1,237 @@
+<div class="st-main">
+  <dl class="st-stats" aria-label="Last 24 hours">
+    <div class="st-stat accent"><dt>Queries · 24h</dt><dd id="qs-total">—</dd></div>
+    <div class="st-stat"><dt>Blocked · 24h</dt><dd id="qs-blocked">—</dd></div>
+    <div class="st-stat"><dt>Block rate · 24h</dt><dd id="qs-rate">—</dd></div>
+    <div class="st-stat"><dt>Busiest 5 minutes</dt><dd id="qs-peak">—</dd></div>
+  </dl>
+
+  <section class="st-section" aria-labelledby="ql-title">
+    <h2 id="ql-title" class="sr-only">Query log</h2>
+    <div class="q-toolbar">
+      <div class="q-search">
+        <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="search-input" type="search" class="form-field" placeholder="Search domain or IP" aria-label="Search domains or client IPs" autocomplete="off">
+        <button id="clear-search" type="button" class="ql-icon-btn q-clear hidden" aria-label="Clear search"><svg class="ic ic-sm" aria-hidden="true"><use href="#i-x"/></svg></button>
+      </div>
+      <div class="q-segments" role="group" aria-label="Filter by result" id="status-filter">
+        <button type="button" data-action="">All</button>
+        <button type="button" data-action="BIFROST_BLOCK"><span class="q-dot" style="color:var(--rose)"></span>Blocked</button>
+        <button type="button" data-action="NOERROR"><span class="q-dot" style="color:var(--blue)"></span>Forwarded</button>
+        <button type="button" data-action="BIFROST_CACHE"><span class="q-dot" style="color:var(--cyan)"></span>Cached</button>
+        <button type="button" data-action="BIFROST_ALLOW"><span class="q-dot" style="color:var(--good)"></span>Allowed</button>
+        <button type="button" data-action="BIFROST_RW"><span class="q-dot" style="color:var(--violet)"></span>Rewritten</button>
+        <button type="button" data-action="NXDOMAIN"><span class="q-dot" style="color:var(--warn)"></span>NXDOMAIN</button>
+        <button type="button" data-action="SERVFAIL"><span class="q-dot" style="color:var(--critical)"></span>SERVFAIL</button>
+      </div>
+      <span class="st-toolbar__spacer"></span>
+      <select id="range-filter" class="form-field" aria-label="Time range" style="width:auto;min-width:140px">
+        <option value="1h">Last hour</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option>
+        <option value="30d">Last 30 days</option><option value="90d">Last 90 days</option><option value="all">All time</option>
+      </select>
+      <button type="button" class="q-live" id="live-toggle" aria-pressed="false" title="Refresh the first page every 5 seconds"><span class="q-dot"></span>Live</button>
+    </div>
+    <div id="results-area"><p class="q-empty">Loading…</p></div>
+  </section>
+
+  <div id="q-status" class="st-savebar st-hidden" role="status" aria-live="polite"><div class="st-savebar__status" id="q-status-text"></div></div>
+</div>
+
+<script>
+(function() {
+  var searchInput = document.getElementById('search-input');
+  var clearBtn = document.getElementById('clear-search');
+  var segments = document.getElementById('status-filter');
+  var resultsArea = document.getElementById('results-area');
+  var liveBtn = document.getElementById('live-toggle');
+  var initial = new URLSearchParams(location.search);
+  var state = {search: initial.get('search') || '', action: initial.get('action') || '',
+               range: initial.get('range') || '90d',
+               sort: initial.get('sort') || 'time', order: initial.get('order') === 'asc' ? 'asc' : 'desc',
+               page: Math.max(1, parseInt(initial.get('page'), 10) || 1)};
+  var searchTimeout, liveTimer, inflight = 0, toastTimer;
+  searchInput.value = state.search;
+  clearBtn.classList.toggle('hidden', !state.search);
+
+  function toast(msg, kind) {
+    var bar = document.getElementById('q-status');
+    document.getElementById('q-status-text').textContent = msg;
+    bar.className = 'st-savebar ' + (kind || '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function() { bar.classList.add('st-hidden'); }, kind === 'error' ? 6000 : 3000);
+  }
+  function syncSegments() {
+    segments.querySelectorAll('button').forEach(function(b) { b.setAttribute('aria-pressed', String(b.dataset.action === state.action)); });
+  }
+
+  function fetchTable(opts) {
+    opts = opts || {};
+    var params = new URLSearchParams();
+    if (state.search) params.set('search', state.search);
+    if (state.action) params.set('action', state.action);
+    if (state.range !== '90d') params.set('range', state.range);
+    params.set('sort', state.sort); params.set('order', state.order); params.set('page', state.page);
+    history.replaceState(null, '', '/query-log?' + params.toString());
+    var open = Array.prototype.map.call(resultsArea.querySelectorAll('.ql-row.open'), function(r) { return r.getAttribute('aria-controls'); });
+    var my = ++inflight;
+    if (!opts.quiet) resultsArea.classList.add('q-loading');
+    return fetch('/api/query-log/table?' + params.toString())
+      .then(function(r) { if (!r.ok) throw new Error(); return r.text(); })
+      .then(function(html) {
+        if (my !== inflight) return;
+        resultsArea.innerHTML = html;
+        open.forEach(function(id) { var row = resultsArea.querySelector('.ql-row[aria-controls="' + id + '"]'); if (row) toggleRow(row, true); });
+      })
+      .catch(function() { if (my === inflight) resultsArea.innerHTML = '<p class="q-empty error-state">Could not load queries. Adjust filters or reload to retry.</p>'; })
+      .finally(function() { if (my === inflight) resultsArea.classList.remove('q-loading'); });
+  }
+
+  function toggleRow(row, force) {
+    var detail = document.getElementById(row.getAttribute('aria-controls'));
+    if (!detail) return;
+    var open = force !== undefined ? force : detail.classList.contains('hidden');
+    detail.classList.toggle('hidden', !open);
+    row.classList.toggle('open', open);
+    row.setAttribute('aria-expanded', String(open));
+  }
+
+  resultsArea.addEventListener('click', function(e) {
+    var th = e.target.closest('th[data-sort]');
+    if (th) {
+      var col = th.dataset.sort;
+      if (state.sort === col) state.order = state.order === 'asc' ? 'desc' : 'asc';
+      else { state.sort = col; state.order = col === 'time' ? 'desc' : 'asc'; }
+      state.page = 1; fetchTable(); return;
+    }
+    var pg = e.target.closest('[data-page]');
+    if (pg && !pg.disabled) { state.page = parseInt(pg.dataset.page, 10); fetchTable(); resultsArea.scrollIntoView({block: 'nearest'}); return; }
+    var copy = e.target.closest('.ql-copy-btn');
+    if (copy) {
+      e.stopPropagation();
+      if (!navigator.clipboard) { toast('Clipboard unavailable in this browser.', 'error'); return; }
+      navigator.clipboard.writeText(copy.dataset.copy).then(function() {
+        copy.classList.add('copied'); setTimeout(function() { copy.classList.remove('copied'); }, 1200);
+        toast('Copied ' + copy.dataset.copy);
+      });
+      return;
+    }
+    if (e.target.closest('a, .ql-menu-btn')) return;
+    var row = e.target.closest('.ql-row');
+    if (row) toggleRow(row);
+  });
+  resultsArea.addEventListener('keydown', function(e) {
+    var row = e.target.closest && e.target.closest('.ql-row');
+    if (row && e.target === row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggleRow(row); }
+  });
+
+  searchInput.addEventListener('input', function() {
+    clearBtn.classList.toggle('hidden', !this.value);
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(function() { state.search = searchInput.value.trim(); state.page = 1; fetchTable(); }, 300);
+  });
+  clearBtn.addEventListener('click', function() {
+    searchInput.value = ''; clearBtn.classList.add('hidden'); state.search = ''; state.page = 1; fetchTable(); searchInput.focus();
+  });
+  segments.addEventListener('click', function(e) {
+    var b = e.target.closest('button'); if (!b) return;
+    state.action = b.dataset.action; state.page = 1; syncSegments(); fetchTable();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === '/' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) { e.preventDefault(); searchInput.focus(); }
+  });
+
+  function setLive(on) {
+    liveBtn.setAttribute('aria-pressed', String(on));
+    clearInterval(liveTimer);
+    try { localStorage.setItem('bifrost.queries.live', on ? '1' : '0'); } catch (e) {}
+    if (on) liveTimer = setInterval(function() {
+      if (document.hidden || state.page !== 1 || !menu.classList.contains('hidden')) return;
+      fetchTable({quiet: true}); loadStats();
+    }, 5000);
+  }
+  liveBtn.addEventListener('click', function() { setLive(liveBtn.getAttribute('aria-pressed') !== 'true'); });
+
+  function loadStats() {
+    fetch('/api/stats/trends').then(function(r) { return r.json(); }).then(function(d) {
+      var rows = d.trends || [], total = 0, blocked = 0, peak = 0;
+      rows.forEach(function(x) { var q = Number(x.queries) || 0, b = Number(x.blocked) || 0; total += q + b; blocked += b; peak = Math.max(peak, q + b); });
+      document.getElementById('qs-total').textContent = total.toLocaleString();
+      document.getElementById('qs-blocked').textContent = blocked.toLocaleString();
+      document.getElementById('qs-rate').textContent = total ? (blocked / total * 100).toFixed(1) + '%' : '—';
+      document.getElementById('qs-peak').textContent = peak.toLocaleString();
+    }).catch(function() {});
+  }
+
+  // Row action menu: one shared, fixed-position menu escapes table overflow.
+  var menu = document.createElement('div');
+  menu.className = 'query-menu hidden';
+  menu.style.position = 'fixed';
+  menu.setAttribute('role', 'menu');
+  document.body.appendChild(menu);
+  var menuDomain = null, menuClient = null;
+
+  function send(method, url, body) {
+    return fetch(url, {method: method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
+  }
+  function closeMenu() { menu.classList.add('hidden'); }
+  function item(action, label, tone) {
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'menu-item ' + (tone || ''); b.dataset.action = action; b.textContent = label; b.setAttribute('role', 'menuitem');
+    return b;
+  }
+  function divider() { var d = document.createElement('div'); d.className = 'menu-divider'; return d; }
+  function openMenu(btn) {
+    menuDomain = btn.dataset.domain; menuClient = btn.dataset.client;
+    var action = btn.dataset.action || '';
+    while (menu.firstChild) menu.removeChild(menu.firstChild);
+    if (action === 'BIFROST_BLOCK') {
+      menu.append(item('unblock', 'Unblock domain (allowlist)', 'tone-good'), item('unblock-client', 'Unblock for ' + menuClient, 'tone-good'));
+    } else if (action === 'BIFROST_ALLOW') {
+      menu.append(item('block', 'Block domain', 'tone-danger'), item('block-client', 'Block for ' + menuClient, 'tone-danger'), divider(), item('remove-allow', 'Remove from allowlist'));
+    } else {
+      menu.append(item('block', 'Block domain', 'tone-danger'), item('block-client', 'Block for ' + menuClient, 'tone-danger'));
+      if (action === 'BIFROST_CACHE') menu.append(divider(), item('clear-cache', 'Clear cached answer', 'tone-warn'));
+    }
+    menu.append(divider(), item('filter-domain', 'Show only this domain'), item('filter-client', 'Show only this client'));
+    var r = btn.getBoundingClientRect();
+    menu.classList.remove('hidden');
+    var top = r.bottom + 4, left = r.right - menu.offsetWidth;
+    if (top + menu.offsetHeight > window.innerHeight) top = r.top - menu.offsetHeight - 4;
+    menu.style.top = Math.max(4, top) + 'px'; menu.style.left = Math.max(4, left) + 'px';
+    menu.querySelector('button').focus();
+  }
+  menu.addEventListener('click', function(e) {
+    var btn = e.target.closest('button[data-action]'); if (!btn) return;
+    var a = btn.dataset.action, req, done;
+    closeMenu();
+    if (a === 'filter-domain' || a === 'filter-client') {
+      state.search = a === 'filter-domain' ? menuDomain : menuClient; state.page = 1;
+      searchInput.value = state.search; clearBtn.classList.remove('hidden'); fetchTable(); return;
+    }
+    if (a === 'block') { req = send('POST', '/api/blocks', {domain: menuDomain}); done = menuDomain + ' blocked.'; }
+    else if (a === 'unblock') { req = send('POST', '/api/unblock', {domain: menuDomain}); done = menuDomain + ' allowlisted.'; }
+    else if (a === 'remove-allow') { req = send('DELETE', '/api/allowlist/' + encodeURIComponent(menuDomain)); done = menuDomain + ' removed from the allowlist.'; }
+    else if (a === 'block-client') { req = send('POST', '/api/client-blocks', {client_ip: menuClient, domain: menuDomain}); done = menuDomain + ' blocked for ' + menuClient + '.'; }
+    else if (a === 'unblock-client') { req = send('DELETE', '/api/client-blocks', {client_ip: menuClient, domain: menuDomain}); done = 'Client rule removed for ' + menuClient + '.'; }
+    else if (a === 'clear-cache') { req = send('POST', '/api/cache/evict', {domain: menuDomain}); done = 'Cache cleared for ' + menuDomain + '.'; }
+    if (req) req.then(function(r) { if (!r.ok) throw new Error(); toast(done); setTimeout(function() { fetchTable({quiet: true}); }, 150); })
+      .catch(function() { toast('Could not apply this action. Please try again.', 'error'); });
+  });
+  document.addEventListener('click', function(e) {
+    var btn = e.target.closest('.ql-menu-btn');
+    if (btn) { e.stopPropagation(); if (menu.classList.contains('hidden')) openMenu(btn); else closeMenu(); return; }
+    if (!menu.contains(e.target)) closeMenu();
+  });
+  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeMenu(); });
+  window.addEventListener('scroll', closeMenu, true);
+
+  var rangeSel = document.getElementById('range-filter');
+  rangeSel.value = state.range;
+  if (rangeSel.value !== state.range) { state.range = '90d'; rangeSel.value = '90d'; }
+  rangeSel.addEventListener('change', function() { state.range = rangeSel.value; state.page = 1; fetchTable(); });
+  syncSegments();
+  fetchTable();
+  loadStats();
+  try { if (localStorage.getItem('bifrost.queries.live') === '1') setLive(true); } catch (e) {}
+})();
+</script>
