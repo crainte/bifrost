@@ -29,7 +29,7 @@ hooks {
       // writes root-owned files into the working tree.
       ["eunit"] {
         glob = "erlang/**"
-        check = "docker run --rm -v \"$PWD/erlang:/src:ro\" -v bifrost-hk-rebar:/cache -e REBAR_BASE_DIR=/cache/_build -e REBAR_CACHE_DIR=/cache/rebar3 -w /src erlang:26 rebar3 eunit"
+        check = "docker run --rm -v \"$PWD/erlang:/src:ro\" -v bifrost-hk-rebar-otp29:/cache -e REBAR_BASE_DIR=/cache/_build -e REBAR_CACHE_DIR=/cache/rebar3 -w /src erlang:29 rebar3 eunit"
       }
     }
   }
