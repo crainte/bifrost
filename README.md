@@ -147,7 +147,7 @@ This starts Postgres and one Bifrost node:
 
 ```sh
 dig @127.0.0.1 -p 1053 example.com
-dig @127.0.0.1 -p 1053 doubleclick.net   # should be blocked
+dig @127.0.0.1 -p 1053 pagead2.googlesyndication.com   # blocked: 0.0.0.0, EDE 15
 ```
 
 Dev config is [`dev/config.yaml`](dev/config.yaml) (Erlang term format, mounted
@@ -222,7 +222,7 @@ mise install && hk install
 ```
 
 - **pre-commit:** `cargo fmt` (fixes are staged), clippy with warnings denied, actionlint
-- **pre-push:** `cargo test`, and EUnit in an `erlang:26` container (needs Docker). Each runs only when its side of the tree changed
+- **pre-push:** `cargo test`, and EUnit in an `erlang:29` container (needs Docker). Each runs only when its side of the tree changed
 
 `hk check --all` runs the pre-commit checks on demand.
 

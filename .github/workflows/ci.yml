@@ -47,9 +47,10 @@ jobs:
   erlang:
     name: Erlang
     runs-on: ${{ github.event_name != 'pull_request' && vars.RUNNER || 'ubuntu-latest' }}
-    # Same image the Dockerfile builds with; the Postgres service is reachable
-    # as host "postgres", which is the test suites' default.
-    container: erlang:26
+    # MUST match the Erlang image in erlang/Dockerfile, so tests run on the OTP
+    # that ships. Dependabot bumps the Dockerfile but not this line. The
+    # Postgres service is reachable as host "postgres", the suites' default.
+    container: erlang:29
     services:
       postgres:
         image: postgres:16
