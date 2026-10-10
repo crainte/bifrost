@@ -251,10 +251,7 @@ failed release can be retried by running the Release workflow again. Merge
 commits, `chore(release)`, `chore(deps)` and non-conventional commits are left
 out of the notes.
 
-Optional repository settings:
-- `RELEASE_TOKEN` secret: a fine-grained PAT with contents and pull-request
-  write access. PRs opened with the default token don't trigger CI, so without
-  it you close and reopen the release PR to get checks.
+Optional repository setting:
 - `RUNNER` variable: a self-hosted runner label (for example an ARC scale set)
   for the Rust, Erlang and image jobs on trusted events. Pull requests,
   including forks, always run on GitHub-hosted runners.

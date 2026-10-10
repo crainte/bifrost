@@ -67,13 +67,9 @@ jobs:
             echo "CLIFF_EOF"
           } >> "$GITHUB_ENV"
 
-      # A PR opened with the default GITHUB_TOKEN does not trigger CI. Set a
-      # RELEASE_TOKEN secret (fine-grained PAT: contents + pull requests write)
-      # to get checks on the release PR; without it, close and reopen the PR.
-      # release.yml runs the full CI as a gate either way.
       - uses: peter-evans/create-pull-request@v8
         with:
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          token: ${{ github.token }}
           branch: release/${{ steps.version.outputs.tag }}
           delete-branch: true
           commit-message: "chore(release): ${{ steps.version.outputs.tag }}"
