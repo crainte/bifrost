@@ -8,7 +8,7 @@ COPY rust/src/ ./rust/src/
 RUN cargo build --release --manifest-path rust/Cargo.toml
 
 # Stage 2: Build Erlang release
-FROM erlang:26 AS erlang-builder
+FROM erlang:29 AS erlang-builder
 WORKDIR /app
 COPY erlang/rebar.config erlang/rebar.lock* ./
 COPY erlang/apps/ ./apps/
@@ -18,7 +18,7 @@ COPY erlang/config/ ./config/
 RUN rebar3 get-deps && rebar3 compile && rebar3 release
 
 # Stage 3: Minimal runtime image
-FROM erlang:26-slim
+FROM erlang:29-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
