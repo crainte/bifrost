@@ -33,6 +33,9 @@ warm_now() ->
 
 init([]) ->
     logger:info("~s started", [?MODULE]),
+    %% This process owns the PTR in-flight table: it must outlive every caller
+    %% of bifrost_ptr:resolve_async/1, including short-lived web requests.
+    ok = bifrost_ptr:init_inflight(),
     %% React to peer loss so a dead leader is replaced promptly, not on the
     %% next 5-min tick.
     net_kernel:monitor_nodes(true),
