@@ -6,7 +6,10 @@
 -module(bifrost_ptr).
 
 -export([reverse_name/1, resolver/0, cached_name/1, resolve_async/1, name_for/2, warm/0,
-         ttl_seconds/0, visible_provenance/0]).
+         ttl_seconds/0, visible_provenance/0, init_inflight/0]).
+
+-define(INFLIGHT, bifrost_ptr_inflight).
+-define(MAX_INFLIGHT, 32).
 
 %% Default re-resolve age (PTR changes per DHCP lease). Overridable at runtime
 %% via the settings table key `ptr_ttl_seconds` (see ttl_seconds/0).
@@ -91,29 +94,55 @@ query_cache(IpBin) ->
 
 %% Live resolve + cache write, run in a detached process. Only when a resolver
 %% is configured; otherwise a no-op (PTR disabled).
+%%
+%% The in-flight table is owned by bifrost_ptr_warmer (see init_inflight/0),
+%% never by the caller: callers include short-lived Cowboy request processes,
+%% and ETS deletes a table with its owner, leaving the spawned workers to crash
+%% on cleanup. If the warmer is restarting the table is briefly absent, and
+%% lookups are simply skipped until it is back.
 resolve_async(IpBin) when is_binary(IpBin) ->
     case resolver() of
         undefined -> ok;
         {ok, NS} ->
-            ensure_inflight(),
-            case ets:update_counter(bifrost_ptr_inflight, active, {2, 1, 32, 32}, {active, 0}) of
-                32 -> ok;
-                _ ->
-                    case ets:insert_new(bifrost_ptr_inflight, {IpBin, true}) of
-                        true ->
-                            Provenance = provenance(),
-                            spawn(fun() ->
-                                try do_resolve(IpBin, NS, Provenance)
-                                after
-                                    ets:delete(bifrost_ptr_inflight, IpBin),
-                                    ets:update_counter(bifrost_ptr_inflight, active, -1)
-                                end
-                            end);
-                        false -> ets:update_counter(bifrost_ptr_inflight, active, -1)
+            case ets:whereis(?INFLIGHT) of
+                undefined -> ok;
+                Tab ->
+                    try admit(Tab, IpBin) of
+                        true -> spawn_resolve(Tab, IpBin, NS);
+                        false -> ok
+                    catch error:badarg -> ok
                     end
             end,
             ok
     end.
+
+%% Claims a slot and the per-IP marker. Every rejection path gives the slot
+%% back: the counter must return to 0 once all workers finish, or the cap
+%% leaks shut and PTR silently stops. Workers hold the table id, not the name,
+%% so a worker outliving a warmer restart cannot release a slot in the NEW
+%% table that it never claimed there.
+admit(Tab, IpBin) ->
+    case ets:update_counter(Tab, active, {2, 1}, {active, 0}) > ?MAX_INFLIGHT of
+        true -> release_slot(Tab), false;
+        false ->
+            case ets:insert_new(Tab, {IpBin, true}) of
+                true -> true;
+                false -> release_slot(Tab), false
+            end
+    end.
+
+spawn_resolve(Tab, IpBin, NS) ->
+    Provenance = provenance(),
+    spawn(fun() ->
+        try do_resolve(IpBin, NS, Provenance)
+        after
+            try ets:delete(Tab, IpBin), release_slot(Tab)
+            catch error:badarg -> ok
+            end
+        end
+    end).
+
+release_slot(Tab) -> ets:update_counter(Tab, active, -1).
 
 %% Background warmer: resolve PTR for recently-active client IPs that are
 %% missing or stale in the cache, so names appear on the Dashboard and Query
@@ -182,12 +211,11 @@ ttl_seconds() ->
     {maps:get(<<"positive_ttl_seconds">>, R, ?TTL_DEFAULT),
      maps:get(<<"negative_ttl_seconds">>, R, 300)}.
 
-ensure_inflight() ->
-    case ets:whereis(bifrost_ptr_inflight) of
-        undefined -> catch ets:new(bifrost_ptr_inflight, [named_table, public, set,
-                                                         {write_concurrency, true}]);
-        _ -> ok
-    end.
+%% Called from bifrost_ptr_warmer:init/1, which makes the long-lived warmer
+%% the table owner on every node.
+init_inflight() ->
+    ets:new(?INFLIGHT, [named_table, public, set, {write_concurrency, true}]),
+    ok.
 
 %% Effective name given a manual label. Precedence: label > PTR > undefined.
 name_for(_IpBin, Label) when is_binary(Label), Label =/= <<>> -> Label;
