@@ -15,6 +15,10 @@
 %%     apply_migration/4, and a hard error when the record fails.
 %%  4. migration_record_uses_bound_parameters — record_migration/3 built its
 %%     INSERT by string interpolation. Fixed with epgsql:equery/3 and $1/$2.
+%%  5. rdap_cache_backfill_unfreezes_age_and_retries_unknowns — rdap_cache stored
+%%     age_days as of the lookup, so ages never advanced, and stored every failure
+%%     as a permanent all-NULL row. Migration 014 must recover registered_on from
+%%     existing rows and turn unclassifiable negatives into one due retry.
 %%
 %% Requires a reachable Postgres. Connection is taken from env so the same suite
 %% runs in CI/dev:
@@ -36,7 +40,8 @@
 -export([applied_migrations_are_not_reapplied/1,
          concurrent_runners_apply_each_migration_once/1,
          failed_migration_rolls_back_and_records_nothing/1,
-         migration_record_uses_bound_parameters/1]).
+         migration_record_uses_bound_parameters/1,
+         rdap_cache_backfill_unfreezes_age_and_retries_unknowns/1]).
 
 -define(RUNNERS, 4).
 
@@ -44,7 +49,8 @@ all() ->
     [applied_migrations_are_not_reapplied,
      concurrent_runners_apply_each_migration_once,
      failed_migration_rolls_back_and_records_nothing,
-     migration_record_uses_bound_parameters].
+     migration_record_uses_bound_parameters,
+     rdap_cache_backfill_unfreezes_age_and_retries_unknowns].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(epgsql),
@@ -166,6 +172,45 @@ migration_record_uses_bound_parameters(Config) ->
     ?assertEqual([{910, list_to_binary(Name)}],
                  [{binary_to_integer(V), F} ||
                      {V, F} <- rows(C, "SELECT version, filename FROM schema_migrations")]),
+    ok = epgsql:close(C).
+
+%% ── 5: rdap_cache backfill (014) ──────────────────────────────
+%% Rows written by the previous release, migrated in place. Runs the REAL
+%% migration files: everything before 014 first, then seeds old-shape rows, then
+%% 014 on its own, exactly as an upgraded pod would see it.
+rdap_cache_backfill_unfreezes_age_and_retries_unknowns(Config) ->
+    C = connect(Config, new_schema(Config, "rdap014")),
+    RealDir = filename:join(code:priv_dir(bifrost), "migrations"),
+    {Before, [Target]} = lists:partition(
+        fun(F) -> F < "014" end,
+        [F || F <- lists:sort(real_migration_files()), F < "015"]),
+    ?assertEqual("014_rdap_cache_status.sql", Target),
+    Read = fun(F) -> {ok, B} = file:read_file(filename:join(RealDir, F)), {F, B} end,
+    with_migration_dir(Config, "rdap014", [Read(F) || F <- Before],
+                       fun() -> ok = bifrost_migrations:run(C) end),
+
+    %% Looked up 30 days ago when it was 10 days old: registered 40 days ago.
+    sq(C, "INSERT INTO rdap_cache (domain, age_days, has_transfer_lock, pending_delete,"
+          " privacy_protected, looked_up) VALUES"
+          " ('aged.example', 10, false, false, true, now() - interval '30 days'),"
+          " ('negative.example', NULL, NULL, NULL, NULL, now() - interval '30 days'),"
+          " ('flags.example', NULL, true, false, false, now())"),
+
+    with_migration_dir(Config, "rdap014", [Read(Target)],
+                       fun() -> ok = bifrost_migrations:run(C) end),
+
+    ?assertEqual([{<<"aged.example">>, <<"ok">>, <<"40">>, <<"0">>, <<"t">>},
+                  {<<"flags.example">>, <<"ok">>, null, <<"0">>, <<"t">>},
+                  {<<"negative.example">>, <<"transient">>, null, <<"0">>, <<"f">>}],
+                 rows(C, "SELECT domain, status, (current_date - registered_on)::text,"
+                         " attempts::text, retry_at IS NULL"
+                         " FROM rdap_cache ORDER BY domain")),
+    %% The negative row is due NOW, not at some later backoff.
+    ?assertEqual([{<<"t">>}],
+                 rows(C, "SELECT retry_at <= now() FROM rdap_cache"
+                         " WHERE domain = 'negative.example'")),
+    %% The CHECK constraint is in place.
+    ?assertMatch({error, _}, epgsql:squery(C, "UPDATE rdap_cache SET status = 'bogus'")),
     ok = epgsql:close(C).
 
 %% ── helpers ───────────────────────────────────────────────────

@@ -87,6 +87,16 @@ init([]) ->
         shutdown => 5000
     },
 
+    %% Paces and deduplicates RDAP registry requests; started before its two
+    %% callers (domain_analyzer scans, web_server page loads).
+    Rdap = #{
+        id => rdap,
+        start => {bifrost_rdap, start_link, []},
+        type => worker,
+        restart => permanent,
+        shutdown => 5000
+    },
+
     DomainAnalyzer = #{
         id => domain_analyzer,
         start => {bifrost_domain_analyzer, start_link, []},
@@ -127,6 +137,7 @@ init([]) ->
         UpstreamMonitor,
         DbWriter,
         QueryWriter,
+        Rdap,
         DomainAnalyzer,
         PtrWarmer,
         LoginLimiter,
