@@ -15,7 +15,9 @@
 %%
 %% ONE SCAN AT A TIME, CLUSTER-WIDE. Scans issue RDAP requests to third-party
 %% registries; two overlapping scans both miss rdap_cache for the same new
-%% domains and both hit the registry. So the GenServer monitors the scan it
+%% domains and both hit the registry. (bifrost_rdap's claim row now also stops
+%% the duplicate request, and paces each registry, but overlapping scans would
+%% still double header probes and upserts.) So the GenServer monitors the scan it
 %% spawned and drops every trigger (timer tick or manual) while it runs, and a
 %% manual scan_now/0 on a non-leader is forwarded to the leader instead of
 %% running locally beside the leader's scan.
@@ -225,8 +227,12 @@ collapse_by_base(Scored) ->
 %% would have loosened that gate by exactly 3 for every candidate. Migration 011
 %% shifts auto_block_min_score by the same 3 to hold the gate where it was — see
 %% the migration for the arithmetic.
+%%
+%% `sync`: this runs on the scan worker, never a request process, so a due
+%% lookup is fetched inline — claimed and paced by bifrost_rdap, so the top
+%% ?RDAP_TOP domains go out at most one per second per registry.
 enrich(#{domain := Domain} = C) ->
-    Rdap = bifrost_api_handler:rdap_cached(Domain),
+    Rdap = bifrost_api_handler:rdap_cached(Domain, sync),
     {ProbeScore, ProbeReasons} = header_probe(Domain),
     C#{
         age_days => maps:get(age_days, Rdap, undefined),

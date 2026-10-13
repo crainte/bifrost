@@ -1,7 +1,8 @@
 -module(bifrost_api_handler).
 
 -export([init/2, push_rewrites/0, push_allowlist/0, push_manual_blocks/0, push_client_blocks/0]).
--export([score_domain/2, score_reasons/2, rdap_lookup/1, rdap_cached/1,
+-export([score_domain/2, score_reasons/2, rdap_lookup/1, rdap_cached/1, rdap_cached/2,
+         rdap_registry/1,
          rdap_reasons/1, score_rdap/1, enrich_with_rdap/1, extract_base_domain/1]).
 
 -define(JSON, #{<<"content-type">> => <<"application/json">>}).
@@ -1319,9 +1320,11 @@ score_reasons(Domain, Hits) ->
 
 %% ── RDAP enrichment ──────────────────────────────────────────
 
+%% Runs inside a page request, so it NEVER contacts a registry: misses are
+%% handed to bifrost_rdap's background fill and come back with
+%% `lookup => pending`; the page re-polls. Cost is one indexed SELECT per domain
+%% whatever the cache state, so the cap only bounds the background queue.
 enrich_with_rdap(Candidates) ->
-    %% The cap is now about page latency on a cold cache only — a warm cache
-    %% costs one indexed SELECT per domain, so this could be raised safely.
     {ToEnrich, Rest} = lists:split(min(10, length(Candidates)), Candidates),
     Enriched = [enrich_one(C) || C <- ToEnrich],
     %% Re-sort after enrichment
@@ -1330,7 +1333,7 @@ enrich_with_rdap(Candidates) ->
     end, Enriched ++ Rest).
 
 enrich_one(C) ->
-    Data = rdap_cached(maps:get(domain, C)),
+    Data = rdap_cached(maps:get(domain, C), async),
     C#{score => maps:get(score, C) + score_rdap(Data),
        reasons => maps:get(reasons, C) ++ rdap_reasons(Data),
        rdap => Data}.
@@ -1343,68 +1346,95 @@ enrich_one(C) ->
 %% 2.ads.example.com, ...) collapses onto a single entry, which is exactly the
 %% shape of the throwaway domains this scan looks for.
 %%
-%% Failures are cached too. Most TLDs have no rdap_server/1 entry at all, and a
-%% 404 or timeout is just as repeatable as a hit — not storing those meant an
-%% unsupported TLD was re-requested on every single scan and page load.
+%% Final outcomes (ok, 404, unsupported TLD) are cached forever. Transient ones
+%% (429, 5xx, timeout) are retried with backoff — see bifrost_rdap — so one bad
+%% minute at a registry no longer removes a domain from age scoring for good.
 %%
-%% Always returns the same four-key shape, so a cache hit and a fresh fetch are
-%% indistinguishable to callers. Unknown fields are `undefined`; score_rdap/1 and
-%% rdap_reasons/1 treat those as "no signal".
+%% Age is computed HERE from the stored registration date. Storing the age
+%% itself froze it: a domain cached at 5 days old stayed "5 days old" forever.
+%%
+%% Mode decides what a due lookup costs the caller:
+%%   sync  — fetch inline, paced and claimed (analyzer scan worker only).
+%%   async — enqueue a background fill and return at once (page requests).
+%%
+%% Always returns the same shape: the four signal keys (undefined = no signal,
+%% which score_rdap/1 and rdap_reasons/1 treat as 0) plus
+%% `lookup => done | pending | unavailable`.
 -spec rdap_cached(binary()) -> #{atom() => term()}.
 rdap_cached(Domain) ->
+    rdap_cached(Domain, sync).
+
+-spec rdap_cached(binary(), sync | async) -> #{atom() => term()}.
+rdap_cached(Domain, Mode) ->
     Base = extract_base_domain(Domain),
-    case db_call(equery, "SELECT age_days, has_transfer_lock, pending_delete, "
-                         "privacy_protected FROM rdap_cache WHERE domain = $1", [Base]) of
-        {ok, _, [{Age, Lock, Del, Priv}]} ->
-            #{age_days => denull(Age), has_transfer_lock => denull(Lock),
-              pending_delete => denull(Del), privacy_protected => denull(Priv)};
-        _ ->
-            Fetched = case rdap_lookup(Base) of
-                          {ok, D} -> D;
-                          {error, _} -> #{}
-                      end,
-            Fields = #{age_days => maps:get(age_days, Fetched, undefined),
-                       has_transfer_lock => maps:get(has_transfer_lock, Fetched, undefined),
-                       pending_delete => maps:get(pending_delete, Fetched, undefined),
-                       privacy_protected => maps:get(privacy_protected, Fetched, undefined)},
-            store_rdap(Base, Fields),
+    case read_rdap(Base) of
+        {due, _} when Mode =:= async ->
+            bifrost_rdap:enqueue(Base),
+            rdap_empty(pending);
+        {due, _} ->
+            _ = bifrost_rdap:fetch(Base),
+            element(2, read_rdap(Base));
+        {cached, Fields} ->
             Fields
     end.
 
-%% Registration facts are immutable, so a stored row is never refreshed: first
-%% writer wins and a concurrent scan on another node is a harmless no-op.
-store_rdap(Base, F) ->
-    _ = db_call(equery,
-        "INSERT INTO rdap_cache (domain, age_days, has_transfer_lock, pending_delete, "
-        "privacy_protected) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (domain) DO NOTHING",
-        [Base, maps:get(age_days, F), maps:get(has_transfer_lock, F),
-         maps:get(pending_delete, F), maps:get(privacy_protected, F)]),
-    ok.
+%% COALESCE covers rows written by the previous release during a rolling
+%% restart (age_days only); migration 014 backfilled the rest.
+%% A Postgres error is `cached`, never `due`: a result that cannot be stored
+%% would be re-fetched on every call.
+read_rdap(Base) ->
+    case db_call(equery,
+            "SELECT status, current_date - COALESCE(registered_on, looked_up::date - age_days), "
+            "has_transfer_lock, pending_delete, privacy_protected, "
+            "COALESCE(retry_at <= now(), false) FROM rdap_cache WHERE domain = $1", [Base]) of
+        {ok, _, []} -> {due, rdap_empty(unavailable)};
+        {ok, _, [{<<"ok">>, Age, Lock, Del, Priv, _}]} ->
+            {cached, #{age_days => denull(Age), has_transfer_lock => denull(Lock),
+                       pending_delete => denull(Del), privacy_protected => denull(Priv),
+                       lookup => done}};
+        {ok, _, [{Final, _, _, _, _, _}]} when Final =:= <<"not_found">>;
+                                              Final =:= <<"unsupported">> ->
+            {cached, rdap_empty(unavailable)};
+        {ok, _, [{_, _, _, _, _, true}]} -> {due, rdap_empty(unavailable)};
+        {ok, _, [{<<"pending">>, _, _, _, _, false}]} -> {cached, rdap_empty(pending)};
+        {ok, _, [{_, _, _, _, _, false}]} -> {cached, rdap_empty(unavailable)};
+        _ -> {cached, rdap_empty(unavailable)}
+    end.
+
+rdap_empty(Lookup) ->
+    #{age_days => undefined, has_transfer_lock => undefined,
+      pending_delete => undefined, privacy_protected => undefined, lookup => Lookup}.
 
 %% epgsql yields `null` for SQL NULL; the rest of the module speaks `undefined`.
 denull(null) -> undefined;
 denull(V) -> V.
 
+%% One live registry request. Unpaced and unclaimed: call through
+%% rdap_cached/1,2 (via bifrost_rdap:fetch/1), never directly.
+-spec rdap_lookup(binary()) -> {ok, map()} | {final, not_found | unsupported}
+                               | {transient, term(), non_neg_integer() | undefined}.
 rdap_lookup(Domain) ->
-    %% Extract base domain (registrable domain, not subdomain)
     BaseDomain = extract_base_domain(Domain),
-    Tld = extract_tld(BaseDomain),
-    case rdap_server(Tld) of
-        undefined -> {error, no_rdap_server};
+    case rdap_registry(BaseDomain) of
+        undefined -> {final, unsupported};
         Server ->
             Url = Server ++ "/domain/" ++ binary_to_list(BaseDomain),
-            case httpc:request(get, {Url, [{"Accept", "application/rdap+json"}]},
-                               [{timeout, 5000}, {connect_timeout, 3000}], []) of
-                {ok, {{_, 200, _}, _, Body}} ->
+            Resp = httpc:request(get, {Url, [{"Accept", "application/rdap+json"}]},
+                                 [{timeout, 5000}, {connect_timeout, 3000}], []),
+            case bifrost_rdap:classify(Resp) of
+                {ok, Body} ->
                     try
                         Data = jsx:decode(list_to_binary(Body), [return_maps]),
                         {ok, parse_rdap(Data)}
-                    catch _:_ -> {error, parse_failed}
+                    catch _:_ -> {transient, parse_failed, undefined}
                     end;
-                {ok, {{_, 404, _}, _, _}} -> {error, not_found};
-                _ -> {error, request_failed}
+                Other -> Other
             end
     end.
+
+%% RDAP base URL for a domain's registry, or undefined if we have none.
+rdap_registry(Domain) ->
+    rdap_server(extract_tld(extract_base_domain(Domain))).
 
 extract_base_domain(Domain) ->
     %% Simple extraction: take last two parts (or three for .co.uk etc)

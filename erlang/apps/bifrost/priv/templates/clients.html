@@ -164,8 +164,11 @@
     return tr;
   }
 
-  function scan(c, body) {
-    clear(body); body.appendChild(make('div', 'c-line', 'Scanning…'));
+  // RDAP misses are filled in the background (the server never calls a registry
+  // inside this request), so rows come back `lookup: pending`; re-poll a few times.
+  function scan(c, body, polls) {
+    polls = polls || 0;
+    if (!polls) { clear(body); body.appendChild(make('div', 'c-line', 'Scanning…')); }
     var key = c._enrich ? 'rdap' : 'plain';
     c._scans = c._scans || {};
     c._scans[key] = c._scans[key] || fetch('/api/clients/' + encodeURIComponent(c.ip) + '/suspicious?hours=24&limit=25' + (c._enrich ? '&enrich=true' : ''))
@@ -175,11 +178,16 @@
       .then(function (d) {
         clear(body);
         var list = (d && d.suspicious) || [];
+        var pending = c._enrich && list.some(function (s) { return s.rdap && s.rdap.lookup === 'pending'; });
+        if (pending) {
+          delete c._scans[key];
+          if (polls < 3) setTimeout(function () { if (body.isConnected && c._enrich) scan(c, body, polls + 1); }, 5000);
+        }
         if (!list.length) { body.appendChild(make('div', 'c-line', 'Nothing suspicious in the last 24 hours.')); return; }
         list.forEach(function (s) {
           var line = make('div', 'c-line'), score = make('span', 'sev ' + (s.score >= 9 ? 'sev-high' : s.score >= 6 ? 'sev-mid' : 'sev-low'), s.score || 0);
           var grow = make('div', 'grow'), top = make('div');
-          top.append(make('span', 'mono', s.domain), make('small', null, '  ' + (s.hits || 0) + ' hits' + (s.rdap && s.rdap.age_days != null ? ' · ' + s.rdap.age_days + 'd old' : '')));
+          top.append(make('span', 'mono', s.domain), make('small', null, '  ' + (s.hits || 0) + ' hits' + (s.rdap && s.rdap.age_days != null ? ' · ' + s.rdap.age_days + 'd old' : '') + (s.rdap && s.rdap.lookup === 'pending' ? ' · registry lookup pending' : '')));
           var tags = make('div', 't-tags'); tags.style.marginTop = '5px';
           (s.reasons || []).forEach(function (r) { var rd = r.indexOf('rdap:') === 0, t = make('span', rd ? 'tag tag-rdap' : 'tag', (rd ? r.slice(5) : r).replace(/_/g, ' ')); if (rd) t.title = 'From RDAP registry data'; tags.appendChild(t); });
           grow.append(top, tags); line.append(score, grow); body.appendChild(line);
