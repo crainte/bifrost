@@ -12,9 +12,18 @@
 %% same domains. Same shape as bifrost_ptr_warmer, so it uses the same election
 %% (bifrost_cluster:is_leader/1). Shardable work uses a per-resource lock
 %% instead — see bifrost_blocklist_manager:try_fetch/4.
+%%
+%% ONE SCAN AT A TIME, CLUSTER-WIDE. Scans issue RDAP requests to third-party
+%% registries; two overlapping scans both miss rdap_cache for the same new
+%% domains and both hit the registry. So the GenServer monitors the scan it
+%% spawned and drops every trigger (timer tick or manual) while it runs, and a
+%% manual scan_now/0 on a non-leader is forwarded to the leader instead of
+%% running locally beside the leader's scan.
 
--export([start_link/0, scan_now/0]).
+-export([start_link/0, scan_now/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+%% spawn_monitor/3 target; the domain_analyzer_scan env can replace it (tests).
+-export([run_scan/0]).
 
 -define(SCAN_INTERVAL, 15 * 60 * 1000).  %% 15 minutes
 -define(FIRST_SCAN_DELAY, 60 * 1000).    %% 1 min after boot (let traffic accrue)
@@ -23,25 +32,48 @@
 -define(RDAP_TOP, 15).                   %% enrich only the N highest scorers
 -define(LEADER, bifrost_domain_analyzer_leader).  %% cluster-wide singleton name
 
--record(state, {}).
+-record(state, {scan :: undefined | {pid(), reference()},
+                scans_started = 0 :: non_neg_integer()}).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+%% Manual trigger. Never runs a scan next to one already in flight, on this or
+%% any other node; see the module header.
 scan_now() ->
     gen_server:cast(?MODULE, scan).
+
+status() ->
+    gen_server:call(?MODULE, status).
 
 init([]) ->
     logger:info("~s started", [?MODULE]),
     erlang:send_after(?FIRST_SCAN_DELAY, self(), scan),
     {ok, #state{}}.
 
+handle_call(status, _From, State = #state{scan = Scan, scans_started = N}) ->
+    {reply, #{running => Scan =/= undefined, scans_started => N}, State};
 handle_call(_Req, _From, State) ->
     {reply, ok, State}.
 
+%% Manual request: run it here if we lead, otherwise hand it to the leader.
+%% Forwarded requests are never forwarded again, so a leadership change in
+%% flight drops one request rather than bouncing it between nodes.
 handle_cast(scan, State) ->
-    do_scan(),
-    {noreply, State};
+    case bifrost_cluster:is_leader(?LEADER) of
+        true -> {noreply, maybe_start_scan(State)};
+        false ->
+            case global:whereis_name(?LEADER) of
+                Pid when is_pid(Pid) -> gen_server:cast(Pid, forwarded_scan);
+                undefined -> ok
+            end,
+            {noreply, State}
+    end;
+handle_cast(forwarded_scan, State) ->
+    case bifrost_cluster:is_leader(?LEADER) of
+        true -> {noreply, maybe_start_scan(State)};
+        false -> {noreply, State}
+    end;
 handle_cast(_Req, State) ->
     {noreply, State}.
 
@@ -50,21 +82,27 @@ handle_info(scan, State) ->
     %% must run on THIS long-lived GenServer process, not the spawned worker:
     %% global frees the name when the registered process dies, and the worker
     %% exits after every scan.
-    case bifrost_cluster:is_leader(?LEADER) of
-        true ->
-            %% Run the scan off the GenServer process — RDAP blocks on network I/O.
-            spawn(fun run_scan/0);
-        false ->
-            ok
+    Next = case bifrost_cluster:is_leader(?LEADER) of
+        true -> maybe_start_scan(State);
+        false -> State
     end,
     erlang:send_after(?SCAN_INTERVAL, self(), scan),
-    {noreply, State};
+    {noreply, Next};
+handle_info({'DOWN', Ref, process, Pid, _}, State = #state{scan = {Pid, Ref}}) ->
+    {noreply, State#state{scan = undefined}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-do_scan() ->
-    spawn(fun run_scan/0),
-    ok.
+%% Runs off the GenServer process (RDAP blocks on network I/O), monitored so the
+%% guard clears however the scan ends. run_scan/0 catches its own errors, but a
+%% kill or a crash outside that try must not leave the guard stuck closed.
+maybe_start_scan(State = #state{scan = {_, _}}) ->
+    logger:info("domain_analyzer: scan already running, request skipped"),
+    State;
+maybe_start_scan(State = #state{scans_started = N}) ->
+    {M, F, A} = application:get_env(bifrost, domain_analyzer_scan,
+                                    {?MODULE, run_scan, []}),
+    State#state{scan = spawn_monitor(M, F, A), scans_started = N + 1}.
 
 %% ── Scan pipeline ────────────────────────────────────────────
 

@@ -34,6 +34,7 @@
          singleton_job_elects_exactly_one_node/1,
          singleton_leadership_fails_over_when_holder_dies/1,
          domain_analyzer_scans_on_one_node_only/1,
+         domain_analyzer_runs_one_scan_at_a_time_cluster_wide/1,
          singleton_catalogue_matches_the_names_jobs_claim/1,
          srv_records_become_peer_node_names/1,
          explicit_seed_list_wins_over_dns_discovery/1,
@@ -65,6 +66,7 @@ all() ->
      singleton_job_elects_exactly_one_node,
      singleton_leadership_fails_over_when_holder_dies,
      domain_analyzer_scans_on_one_node_only,
+     domain_analyzer_runs_one_scan_at_a_time_cluster_wide,
      singleton_catalogue_matches_the_names_jobs_claim,
      srv_records_become_peer_node_names,
      explicit_seed_list_wins_over_dns_discovery,
@@ -472,6 +474,53 @@ domain_analyzer_scans_on_one_node_only(Config) ->
     after
         [catch erpc:call(N, gen_server, stop, [Pid]) || {N, Pid} <- Started]
     end.
+
+%% Every scan can issue RDAP requests to third-party registries, so overlapping
+%% scans are what the guard exists to prevent: two scans started together both
+%% miss rdap_cache for the same new domains and both hit the registry. Only the
+%% leader may run a scan, and only one at a time, no matter how many ticks or
+%% manual "Scan now" requests arrive on which node.
+%%
+%% The scan body is swapped for a sleep (domain_analyzer_scan env) so it stays
+%% genuinely in flight while every trigger fires; the guard itself is real.
+domain_analyzer_runs_one_scan_at_a_time_cluster_wide(Config) ->
+    [A, B] = ?config(nodes, Config),
+    [ok = erpc:call(N, application, set_env,
+                    [bifrost, domain_analyzer_scan, {timer, sleep, [2000]}]) || N <- [A, B]],
+    Started = [begin
+                   {ok, Pid} = erpc:call(N, gen_server, start,
+                                         [{local, bifrost_domain_analyzer},
+                                          bifrost_domain_analyzer, [], []]),
+                   {N, Pid}
+               end || N <- [A, B]],
+    try
+        %% Elect: tick A alone first so the holder is known.
+        {_, PidA} = lists:keyfind(A, 1, Started),
+        erpc:call(A, erlang, send, [PidA, scan]),
+        ok = wait_until(fun() -> scans(A) =:= {true, 1} end),
+        %% Every trigger, on both nodes, while that scan is in flight.
+        [begin
+             erpc:call(N, erlang, send, [Pid, scan]),
+             erpc:call(N, bifrost_domain_analyzer, scan_now, [])
+         end || {N, Pid} <- Started, _ <- lists:seq(1, 5)],
+        timer:sleep(500),
+        ?assertEqual({true, 1}, scans(A)),
+        ?assertEqual({false, 0}, scans(B)),
+        %% Once it finishes, a manual request on the NON-leader runs exactly one
+        %% more scan, on the leader.
+        ok = wait_until(fun() -> scans(A) =:= {false, 1} end),
+        ok = erpc:call(B, bifrost_domain_analyzer, scan_now, []),
+        ok = wait_until(fun() -> scans(A) =:= {true, 2} end),
+        ?assertEqual({false, 0}, scans(B))
+    after
+        [catch erpc:call(N, gen_server, stop, [Pid]) || {N, Pid} <- Started],
+        [catch erpc:call(N, application, unset_env, [bifrost, domain_analyzer_scan])
+         || N <- [A, B]]
+    end.
+
+scans(Node) ->
+    #{running := R, scans_started := S} = erpc:call(Node, bifrost_domain_analyzer, status, []),
+    {R, S}.
 
 %% bifrost_cluster:singleton_jobs/0 is the single source the dashboard renders,
 %% so a job whose ?LEADER name drifts from its catalogue entry would leave a
