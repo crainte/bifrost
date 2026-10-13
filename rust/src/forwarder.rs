@@ -203,7 +203,7 @@ impl Forwarder {
         let result = match timeout_at(deadline, self.query_one(query, request, upstream.addr)).await
         {
             Ok(Ok(answer)) => {
-                if Message::from_bytes(&answer.0)?.response_code()
+                if Message::from_bytes(&answer.0)?.metadata.response_code
                     == hickory_proto::op::ResponseCode::ServFail
                 {
                     Err("upstream returned SERVFAIL".into())
@@ -336,9 +336,9 @@ fn matches_request(resp: &[u8], txid: u16, request: &Message) -> bool {
     }
     match Message::from_bytes(resp) {
         Ok(m) => {
-            m.message_type() == hickory_proto::op::MessageType::Response
-                && m.queries().len() == request.queries().len()
-                && m.queries().iter().zip(request.queries()).all(|(a, b)| {
+            m.metadata.message_type == hickory_proto::op::MessageType::Response
+                && m.queries.len() == request.queries.len()
+                && m.queries.iter().zip(&request.queries).all(|(a, b)| {
                     a.name().eq_case(b.name())
                         && a.query_type() == b.query_type()
                         && a.query_class() == b.query_class()
@@ -351,7 +351,7 @@ fn matches_request(resp: &[u8], txid: u16, request: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
@@ -360,9 +360,8 @@ mod tests {
     const CLIENT_ID: u16 = 0x1234;
 
     fn query(name: &str) -> Vec<u8> {
-        let mut m = Message::new();
-        m.set_id(CLIENT_ID);
-        m.set_recursion_desired(true);
+        let mut m = Message::new(CLIENT_ID, MessageType::Query, OpCode::Query);
+        m.metadata.recursion_desired = true;
         m.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
         m.to_bytes().unwrap()
     }
@@ -376,16 +375,18 @@ mod tests {
         tc: bool,
     ) -> Vec<u8> {
         let req = Message::from_bytes(query_bytes).unwrap();
-        let mut r = Message::new();
-        r.set_id(id.unwrap_or(req.id()));
-        r.set_message_type(MessageType::Response);
-        r.set_response_code(ResponseCode::NoError);
-        r.set_truncated(tc);
+        let mut r = Message::new(
+            id.unwrap_or(req.metadata.id),
+            MessageType::Response,
+            OpCode::Query,
+        );
+        r.metadata.response_code = ResponseCode::NoError;
+        r.metadata.truncation = tc;
         let name = match qname {
             Some(n) => Name::from_ascii(n).unwrap(),
-            None => req.queries()[0].name().clone(),
+            None => req.queries[0].name().clone(),
         };
-        r.add_query(Query::query(name.clone(), req.queries()[0].query_type()));
+        r.add_query(Query::query(name.clone(), req.queries[0].query_type()));
         if !tc {
             r.add_answer(Record::from_rdata(
                 name,
@@ -398,7 +399,7 @@ mod tests {
 
     fn answer_ip(resp: &[u8]) -> String {
         let m = Message::from_bytes(resp).unwrap();
-        match m.answers().first().and_then(|r| r.data()) {
+        match m.answers.first().map(|r| &r.data) {
             Some(RData::A(a)) => a.0.to_string(),
             other => panic!("no A answer: {other:?}"),
         }
@@ -525,7 +526,7 @@ mod tests {
                 let (n, src) = socket.recv_from(&mut buf).await.unwrap();
                 let mut resp =
                     Message::from_bytes(&answer(&buf[..n], [0; 4], None, None, false)).unwrap();
-                resp.set_response_code(rcode);
+                resp.metadata.response_code = rcode;
                 socket
                     .send_to(&resp.to_bytes().unwrap(), src)
                     .await
@@ -555,7 +556,7 @@ mod tests {
     async fn response_carries_the_clients_id() {
         let (up, _) = upstream([1, 1, 1, 1]).await;
         let (resp, _) = fwd(vec![up]).forward(&query("a.example.")).await.unwrap();
-        assert_eq!(Message::from_bytes(&resp).unwrap().id(), CLIENT_ID);
+        assert_eq!(Message::from_bytes(&resp).unwrap().metadata.id, CLIENT_ID);
     }
 
     #[tokio::test]
@@ -742,7 +743,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer_ip(&resp), "4.4.4.4");
-        assert_eq!(Message::from_bytes(&resp).unwrap().id(), CLIENT_ID);
+        assert_eq!(Message::from_bytes(&resp).unwrap().metadata.id, CLIENT_ID);
     }
 
     #[tokio::test]

@@ -192,28 +192,29 @@ async fn handle_query(
         }
     };
 
-    let rejection = if request.message_type() != MessageType::Query || request.queries().len() != 1
-    {
-        Some(ResponseCode::FormErr)
-    } else if request.op_code() != hickory_proto::op::OpCode::Query {
-        Some(ResponseCode::NotImp)
-    } else if request.queries()[0].query_class() != hickory_proto::rr::DNSClass::IN {
-        Some(ResponseCode::Refused)
-    } else {
-        None
-    };
+    let rejection =
+        if request.metadata.message_type != MessageType::Query || request.queries.len() != 1 {
+            Some(ResponseCode::FormErr)
+        } else if request.metadata.op_code != hickory_proto::op::OpCode::Query {
+            Some(ResponseCode::NotImp)
+        } else if request.queries[0].query_class() != hickory_proto::rr::DNSClass::IN {
+            Some(ResponseCode::Refused)
+        } else {
+            None
+        };
     if let Some(rcode) = rejection {
-        let mut response = Message::new();
-        response.set_id(request.id());
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(request.op_code());
-        response.set_recursion_desired(request.recursion_desired());
-        response.set_response_code(rcode);
-        response.add_queries(request.queries().to_vec());
+        let mut response = Message::new(
+            request.metadata.id,
+            MessageType::Response,
+            request.metadata.op_code,
+        );
+        response.metadata.recursion_desired = request.metadata.recursion_desired;
+        response.metadata.response_code = rcode;
+        response.add_queries(request.queries.to_vec());
         return Ok(response.to_bytes()?);
     }
 
-    let question = match request.queries().first() {
+    let question = match request.queries.first() {
         Some(q) => q,
         None => {
             warn!("query has no question section");
@@ -222,12 +223,14 @@ async fn handle_query(
     };
 
     if !state.read().await.acl.permits(src.ip()) {
-        let mut response = Message::new();
-        response.set_message_type(MessageType::Response);
-        response.set_id(request.id());
-        response.set_recursion_desired(request.recursion_desired());
-        response.add_queries(request.queries().to_vec());
-        response.set_response_code(ResponseCode::Refused);
+        let mut response = Message::new(
+            request.metadata.id,
+            MessageType::Response,
+            request.metadata.op_code,
+        );
+        response.metadata.recursion_desired = request.metadata.recursion_desired;
+        response.add_queries(request.queries.to_vec());
+        response.metadata.response_code = ResponseCode::Refused;
         if let Err(e) = event_tx.try_send(WriterMessage::Event(QueryEvent::new(
             src.ip().to_string(),
             question
@@ -275,7 +278,7 @@ async fn handle_query(
         let s = state.read().await;
         if let Some(target) = s.rewrites.lookup(domain_trimmed) {
             let response = build_rewrite_response(&request, target);
-            let client_rcode = response.response_code();
+            let client_rcode = response.metadata.response_code;
             let bytes = response.to_bytes()?;
             drop(s);
 
@@ -331,7 +334,7 @@ async fn handle_query(
             };
             if let Some(list_id) = block_reason {
                 let response = build_blocked_response(&request, mode)?;
-                let client_rcode = response.response_code();
+                let client_rcode = response.metadata.response_code;
                 let bytes = response.to_bytes()?;
                 drop(s);
 
@@ -361,26 +364,26 @@ async fn handle_query(
         {
             let mut response = cached.clone();
             let cached_rcode = Message::from_bytes(&cached)
-                .map(|m| action_from_rcode(m.response_code()))
+                .map(|m| action_from_rcode(m.metadata.response_code))
                 .unwrap_or(Action::Unknown);
-            let id_bytes = request.id().to_be_bytes();
+            let id_bytes = request.metadata.id.to_be_bytes();
             response[..2].copy_from_slice(&id_bytes);
 
             // Rewrite TTL in each answer to reflect remaining time, and echo the
             // asker's own question: the cached bytes carry the FIRST asker's
             // letter case, which 0x20-randomising resolvers would reject.
             if let Ok(mut msg) = Message::from_bytes(&response) {
-                for ans in msg.answers_mut() {
-                    ans.set_ttl(remaining_ttl);
+                for ans in &mut msg.answers {
+                    ans.ttl = remaining_ttl;
                 }
-                for ans in msg.name_servers_mut() {
-                    ans.set_ttl(ans.ttl().min(remaining_ttl));
+                for ans in &mut msg.authorities {
+                    ans.ttl = ans.ttl.min(remaining_ttl);
                 }
-                for ans in msg.additionals_mut() {
-                    ans.set_ttl(ans.ttl().min(remaining_ttl));
+                for ans in &mut msg.additionals {
+                    ans.ttl = ans.ttl.min(remaining_ttl);
                 }
-                msg.take_queries();
-                msg.add_queries(request.queries().to_vec());
+                msg.queries.clear();
+                msg.add_queries(request.queries.to_vec());
                 if let Ok(updated) = msg.to_bytes() {
                     response = updated;
                 }
@@ -411,13 +414,15 @@ async fn handle_query(
         Some(policy) => match policy.decide(domain_trimmed, qtype) {
             crate::routing::Decision::Forward(f) => f,
             crate::routing::Decision::PrivateNegative => {
-                let mut response = Message::new();
-                response.set_id(request.id());
-                response.set_message_type(MessageType::Response);
-                response.set_recursion_desired(request.recursion_desired());
-                response.set_recursion_available(true);
-                response.set_response_code(ResponseCode::NXDomain);
-                response.add_queries(request.queries().to_vec());
+                let mut response = Message::new(
+                    request.metadata.id,
+                    MessageType::Response,
+                    request.metadata.op_code,
+                );
+                response.metadata.recursion_desired = request.metadata.recursion_desired;
+                response.metadata.recursion_available = true;
+                response.metadata.response_code = ResponseCode::NXDomain;
+                response.add_queries(request.queries.to_vec());
                 return Ok(response.to_bytes()?);
             }
         },
@@ -477,7 +482,7 @@ async fn handle_query(
 
     let action = upstream_msg
         .as_ref()
-        .map(|m| action_from_rcode(m.response_code()))
+        .map(|m| action_from_rcode(m.metadata.response_code))
         .unwrap_or(Action::Unknown);
     let client_rcode = action.clone();
 
@@ -503,65 +508,71 @@ fn build_blocked_response(
     request: &Message,
     mode: &BlockMode,
 ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
-    let mut response = Message::new();
-    response.set_message_type(MessageType::Response);
-    response.set_id(request.id());
-    response.set_recursion_desired(true);
-    response.set_recursion_available(true);
-    response.add_queries(request.queries().to_vec());
+    let mut response = Message::new(
+        request.metadata.id,
+        MessageType::Response,
+        request.metadata.op_code,
+    );
+    response.metadata.recursion_desired = true;
+    response.metadata.recursion_available = true;
+    response.add_queries(request.queries.to_vec());
 
     match mode {
         BlockMode::NXDomain => {
-            response.set_response_code(ResponseCode::NXDomain);
+            response.metadata.response_code = ResponseCode::NXDomain;
         }
         BlockMode::Refused => {
-            response.set_response_code(ResponseCode::Refused);
+            response.metadata.response_code = ResponseCode::Refused;
         }
         BlockMode::ZeroIp => {
-            response.set_response_code(ResponseCode::NoError);
-            let question = request.queries().first();
+            response.metadata.response_code = ResponseCode::NoError;
+            let question = request.queries.first();
             if let Some(q) = question {
                 let qtype = q.query_type();
                 let name = q.name().clone();
-                let mut record = Record::new();
-                record.set_name(name);
-                record.set_dns_class(q.query_class());
-                record.set_ttl(60);
-
                 if qtype == RecordType::A {
-                    record.set_record_type(RecordType::A);
-                    record.set_data(Some(RData::A(hickory_proto::rr::rdata::A::new(0, 0, 0, 0))));
+                    let mut record = Record::from_rdata(
+                        name,
+                        60,
+                        RData::A(hickory_proto::rr::rdata::A::new(0, 0, 0, 0)),
+                    );
+                    record.dns_class = q.query_class();
                     response.add_answer(record);
                 } else if qtype == RecordType::AAAA {
-                    record.set_record_type(RecordType::AAAA);
-                    record.set_data(Some(RData::AAAA(hickory_proto::rr::rdata::AAAA::new(
-                        0, 0, 0, 0, 0, 0, 0, 0,
-                    ))));
+                    let mut record = Record::from_rdata(
+                        name,
+                        60,
+                        RData::AAAA(hickory_proto::rr::rdata::AAAA::new(0, 0, 0, 0, 0, 0, 0, 0)),
+                    );
+                    record.dns_class = q.query_class();
                     response.add_answer(record);
                 }
             }
         }
         BlockMode::CustomIp(ip) => {
-            response.set_response_code(ResponseCode::NoError);
-            let question = request.queries().first();
+            response.metadata.response_code = ResponseCode::NoError;
+            let question = request.queries.first();
             if let Some(q) = question {
                 let qtype = q.query_type();
                 let name = q.name().clone();
-                let mut record = Record::new();
-                record.set_name(name);
-                record.set_dns_class(q.query_class());
-                record.set_ttl(60);
-
                 if qtype == RecordType::A {
                     if let std::net::IpAddr::V4(v4) = ip {
-                        record.set_record_type(RecordType::A);
-                        record.set_data(Some(RData::A(hickory_proto::rr::rdata::A(*v4))));
+                        let mut record = Record::from_rdata(
+                            name,
+                            60,
+                            RData::A(hickory_proto::rr::rdata::A(*v4)),
+                        );
+                        record.dns_class = q.query_class();
                         response.add_answer(record);
                     }
                 } else if qtype == RecordType::AAAA {
                     if let std::net::IpAddr::V6(v6) = ip {
-                        record.set_record_type(RecordType::AAAA);
-                        record.set_data(Some(RData::AAAA(hickory_proto::rr::rdata::AAAA(*v6))));
+                        let mut record = Record::from_rdata(
+                            name,
+                            60,
+                            RData::AAAA(hickory_proto::rr::rdata::AAAA(*v6)),
+                        );
+                        record.dns_class = q.query_class();
                         response.add_answer(record);
                     }
                 }
@@ -573,46 +584,52 @@ fn build_blocked_response(
     edns.set_max_payload(1232);
     edns.options_mut()
         .insert(EdnsOption::Unknown(15, vec![0, 15]));
-    *response.extensions_mut() = Some(edns);
+    response.edns = Some(edns);
 
     Ok(response)
 }
 
 fn build_rewrite_response(request: &Message, target: &Target) -> Message {
-    let mut response = Message::new();
-    response.set_message_type(MessageType::Response);
-    response.set_id(request.id());
-    response.set_recursion_desired(true);
-    response.set_recursion_available(true);
-    response.add_queries(request.queries().to_vec());
-    response.set_response_code(ResponseCode::NoError);
+    let mut response = Message::new(
+        request.metadata.id,
+        MessageType::Response,
+        request.metadata.op_code,
+    );
+    response.metadata.recursion_desired = true;
+    response.metadata.recursion_available = true;
+    response.add_queries(request.queries.to_vec());
+    response.metadata.response_code = ResponseCode::NoError;
 
-    if let Some(q) = request.queries().first() {
+    if let Some(q) = request.queries.first() {
         let qtype = q.query_type();
-        let mut record = Record::new();
-        record.set_name(q.name().clone());
-        record.set_dns_class(q.query_class());
-        record.set_ttl(60);
+        let name = q.name().clone();
+        let dns_class = q.query_class();
 
         match target {
             // A record only answers A queries; AAAA only AAAA. A mismatched
             // qtype yields an empty NOERROR (correct: the name exists, no such type).
             Target::Ip(std::net::IpAddr::V4(v4)) if qtype == RecordType::A => {
-                record.set_record_type(RecordType::A);
-                record.set_data(Some(RData::A(hickory_proto::rr::rdata::A(*v4))));
+                let mut record =
+                    Record::from_rdata(name, 60, RData::A(hickory_proto::rr::rdata::A(*v4)));
+                record.dns_class = dns_class;
                 response.add_answer(record);
             }
             Target::Ip(std::net::IpAddr::V6(v6)) if qtype == RecordType::AAAA => {
-                record.set_record_type(RecordType::AAAA);
-                record.set_data(Some(RData::AAAA(hickory_proto::rr::rdata::AAAA(*v6))));
+                let mut record =
+                    Record::from_rdata(name, 60, RData::AAAA(hickory_proto::rr::rdata::AAAA(*v6)));
+                record.dns_class = dns_class;
                 response.add_answer(record);
             }
             // CNAME answers any qtype — resolver follows the alias for the real type.
             Target::Cname(name) => {
                 if let Ok(mut cname) = Name::from_utf8(name) {
                     cname.set_fqdn(true);
-                    record.set_record_type(RecordType::CNAME);
-                    record.set_data(Some(RData::CNAME(hickory_proto::rr::rdata::CNAME(cname))));
+                    let mut record = Record::from_rdata(
+                        q.name().clone(),
+                        60,
+                        RData::CNAME(hickory_proto::rr::rdata::CNAME(cname)),
+                    );
+                    record.dns_class = dns_class;
                     response.add_answer(record);
                 }
             }
@@ -631,11 +648,11 @@ fn build_rewrite_response(request: &Message, target: &Target) -> Message {
 /// replay it to every client, and to every peer, for the whole TTL.
 fn cache_variant(request: &Message) -> Option<String> {
     let (do_bit, ecs) = request
-        .extensions()
+        .edns
         .as_ref()
         .map(|e| {
             (
-                e.dnssec_ok(),
+                e.flags().dnssec_ok,
                 e.options()
                     .as_ref()
                     .iter()
@@ -643,23 +660,26 @@ fn cache_variant(request: &Message) -> Option<String> {
             )
         })
         .unwrap_or((false, false));
-    (!ecs).then(|| format!("{}:{}", do_bit as u8, request.checking_disabled() as u8))
+    (!ecs).then(|| {
+        format!(
+            "{}:{}",
+            do_bit as u8, request.metadata.checking_disabled as u8
+        )
+    })
 }
 
 fn cache_ttl(msg: &Message) -> Option<u32> {
-    if msg.truncated() {
+    if msg.metadata.truncation {
         return None;
     }
     let negative = || {
-        msg.name_servers().iter().find_map(|r| match r.data() {
-            Some(RData::SOA(soa)) => Some(r.ttl().min(soa.minimum())),
+        msg.authorities.iter().find_map(|r| match &r.data {
+            RData::SOA(soa) => Some(r.ttl.min(soa.minimum)),
             _ => None,
         })
     };
-    match msg.response_code() {
-        ResponseCode::NoError if !msg.answers().is_empty() => {
-            msg.answers().iter().map(|r| r.ttl()).min()
-        }
+    match msg.metadata.response_code {
+        ResponseCode::NoError if !msg.answers.is_empty() => msg.answers.iter().map(|r| r.ttl).min(),
         ResponseCode::NoError | ResponseCode::NXDomain => negative(),
         _ => None,
     }
@@ -683,28 +703,24 @@ fn action_from_rcode(rcode: ResponseCode) -> Action {
 }
 
 fn extract_response_records(msg: &Message) -> Vec<ResponseRecord> {
-    msg.answers()
+    msg.answers
         .iter()
         .map(|r| {
             let rtype = r.record_type().to_string();
-            let value = match r.data() {
-                Some(RData::A(addr)) => addr.0.to_string(),
-                Some(RData::AAAA(addr)) => addr.0.to_string(),
-                Some(RData::CNAME(name)) => name.to_string(),
-                Some(RData::MX(mx)) => format!("{} {}", mx.preference(), mx.exchange()),
-                Some(RData::TXT(txt)) => txt.to_string(),
-                Some(RData::NS(ns)) => ns.to_string(),
-                Some(RData::PTR(ptr)) => ptr.to_string(),
-                Some(RData::SOA(soa)) => format!("{} {}", soa.mname(), soa.rname()),
-                Some(RData::SRV(srv)) => format!(
+            let value = match &r.data {
+                RData::A(addr) => addr.0.to_string(),
+                RData::AAAA(addr) => addr.0.to_string(),
+                RData::CNAME(name) => name.to_string(),
+                RData::MX(mx) => format!("{} {}", mx.preference, mx.exchange),
+                RData::TXT(txt) => txt.to_string(),
+                RData::NS(ns) => ns.to_string(),
+                RData::PTR(ptr) => ptr.to_string(),
+                RData::SOA(soa) => format!("{} {}", soa.mname, soa.rname),
+                RData::SRV(srv) => format!(
                     "{} {} {} {}",
-                    srv.priority(),
-                    srv.weight(),
-                    srv.port(),
-                    srv.target()
+                    srv.priority, srv.weight, srv.port, srv.target
                 ),
-                Some(data) => format!("{:?}", data),
-                None => "".to_string(),
+                data => format!("{:?}", data),
             };
             ResponseRecord { rtype, value }
         })
@@ -714,13 +730,12 @@ fn extract_response_records(msg: &Message) -> Vec<ResponseRecord> {
 /// Build SERVFAIL response bytes for a query, preserving its ID + question.
 /// Falls back to a bare SERVFAIL if the query won't parse.
 fn build_servfail(query: &[u8]) -> Vec<u8> {
-    let mut response = Message::new();
-    response.set_message_type(MessageType::Response);
-    response.set_response_code(ResponseCode::ServFail);
-    response.set_recursion_desired(true);
+    let mut response = Message::new(0, MessageType::Response, hickory_proto::op::OpCode::Query);
+    response.metadata.response_code = ResponseCode::ServFail;
+    response.metadata.recursion_desired = true;
     if let Ok(request) = Message::from_bytes(query) {
-        response.set_id(request.id());
-        response.add_queries(request.queries().to_vec());
+        response.metadata.id = request.metadata.id;
+        response.add_queries(request.queries.to_vec());
     }
     response.to_bytes().unwrap_or_else(|_| {
         // Absolute fallback: 12-byte header echoing ID with SERVFAIL rcode.
@@ -746,15 +761,14 @@ fn truncate_for_client(query: &[u8], response: Vec<u8>) -> Vec<u8> {
         return response;
     }
     // Rebuild a minimal truncated response preserving id + question.
-    let mut trunc = Message::new();
-    trunc.set_message_type(MessageType::Response);
-    trunc.set_truncated(true);
-    trunc.set_recursion_desired(true);
-    trunc.set_recursion_available(true);
+    let mut trunc = Message::new(0, MessageType::Response, hickory_proto::op::OpCode::Query);
+    trunc.metadata.truncation = true;
+    trunc.metadata.recursion_desired = true;
+    trunc.metadata.recursion_available = true;
     if let Ok(req) = Message::from_bytes(query) {
-        trunc.set_id(req.id());
-        trunc.set_response_code(ResponseCode::NoError);
-        trunc.add_queries(req.queries().to_vec());
+        trunc.metadata.id = req.metadata.id;
+        trunc.metadata.response_code = ResponseCode::NoError;
+        trunc.add_queries(req.queries.to_vec());
     }
     match trunc.to_bytes() {
         // Only substitute if it actually fits; otherwise send original bytes and
@@ -768,7 +782,7 @@ fn truncate_for_client(query: &[u8], response: Vec<u8>) -> Vec<u8> {
 fn client_max_payload(query: &[u8]) -> usize {
     match Message::from_bytes(query) {
         Ok(msg) => msg
-            .extensions()
+            .edns
             .as_ref()
             .map(|e| e.max_payload() as usize)
             .filter(|&s| s >= 512)
@@ -783,8 +797,8 @@ mod tests {
     use hickory_proto::op::Query;
 
     fn query(name: &str, qtype: RecordType) -> Message {
-        let mut m = Message::new();
-        m.set_id(0x1234);
+        let mut m = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+        m.metadata.id = 0x1234;
         // from_ascii, not from_utf8: from_utf8 applies IDNA mapping, which
         // lowercases, so mixed-case tests would silently send lowercase.
         m.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
@@ -795,11 +809,11 @@ mod tests {
     fn rewrite_a_query_to_ip_answers_a_record() {
         let req = query("nas.home.", RecordType::A);
         let resp = build_rewrite_response(&req, &Target::Ip("192.168.1.5".parse().unwrap()));
-        assert_eq!(resp.id(), 0x1234);
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert_eq!(resp.answers().len(), 1);
-        match resp.answers()[0].data() {
-            Some(RData::A(a)) => assert_eq!(a.0.to_string(), "192.168.1.5"),
+        assert_eq!(resp.metadata.id, 0x1234);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            RData::A(a) => assert_eq!(a.0.to_string(), "192.168.1.5"),
             other => panic!("expected A, got {:?}", other),
         }
     }
@@ -809,17 +823,17 @@ mod tests {
         // AAAA query but rewrite target is IPv4 → name exists, no AAAA. Empty NOERROR.
         let req = query("nas.home.", RecordType::AAAA);
         let resp = build_rewrite_response(&req, &Target::Ip("192.168.1.5".parse().unwrap()));
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(resp.answers.len(), 0);
     }
 
     #[test]
     fn rewrite_cname_answers_any_qtype() {
         let req = query("www.home.", RecordType::A);
         let resp = build_rewrite_response(&req, &Target::Cname("server.home".into()));
-        assert_eq!(resp.answers().len(), 1);
-        match resp.answers()[0].data() {
-            Some(RData::CNAME(c)) => assert_eq!(c.0.to_utf8(), "server.home."),
+        assert_eq!(resp.answers.len(), 1);
+        match &resp.answers[0].data {
+            RData::CNAME(c) => assert_eq!(c.0.to_utf8(), "server.home."),
             other => panic!("expected CNAME, got {:?}", other),
         }
     }
@@ -830,9 +844,9 @@ mod tests {
         let q = query("example.com.", RecordType::A);
         let bytes = build_servfail(&q.to_bytes().unwrap());
         let resp = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(resp.id(), 0x1234);
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
-        assert_eq!(resp.queries().len(), 1);
+        assert_eq!(resp.metadata.id, 0x1234);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(resp.queries.len(), 1);
     }
 
     #[test]
@@ -875,7 +889,7 @@ mod tests {
             for name in ["version.bind.", "id.server.", "hostname.bind."] {
                 for enabled in [true, false] {
                     let mut req = query(name, RecordType::TXT);
-                    req.queries_mut()[0].set_query_class(class);
+                    req.queries[0].set_query_class(class);
                     let (tx, _rx) = mpsc::channel(16);
                     let bytes = handle_query(
                         "192.168.1.42:5000".parse().unwrap(),
@@ -888,10 +902,10 @@ mod tests {
                     .await
                     .unwrap();
                     let resp = Message::from_bytes(&bytes).unwrap();
-                    assert_eq!(resp.response_code(), ResponseCode::Refused);
-                    assert_eq!(resp.id(), req.id());
-                    assert_eq!(resp.queries(), req.queries());
-                    assert!(resp.answers().is_empty());
+                    assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+                    assert_eq!(resp.metadata.id, req.metadata.id);
+                    assert_eq!(resp.queries, req.queries);
+                    assert!(resp.answers.is_empty());
                 }
             }
         }
@@ -901,9 +915,9 @@ mod tests {
     async fn conditional_routes_never_fall_back_to_default_group() {
         use crate::routing::{Group, Route, Routing};
         let healthy_default = scripted_upstream(|req| {
-            let mut r = Message::new();
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
             r.add_answer(Record::from_rdata(
-                req.queries()[0].name().clone(),
+                req.queries[0].name().clone(),
                 300,
                 RData::A(hickory_proto::rr::rdata::A::new(1, 2, 3, 4)),
             ));
@@ -924,14 +938,14 @@ mod tests {
         .unwrap();
         st.write().await.routing = Some(Arc::new(Routing::compile(&default, vec![route]).unwrap()));
         let resp = run_handler(&st, &query("host.internal.", RecordType::A)).await;
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
     }
 
     #[tokio::test]
     async fn policy_cache_is_isolated_and_propagation_is_tagged() {
         let st = state_with_upstream(|req| {
-            let mut r = Message::new();
-            let name = req.queries()[0].name().clone();
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            let name = req.queries[0].name().clone();
             r.add_answer(Record::from_rdata(
                 name,
                 300,
@@ -998,9 +1012,9 @@ mod tests {
     #[tokio::test]
     async fn ecs_queries_bypass_shared_cache() {
         let st = state_with_upstream(|req| {
-            let mut r = Message::new();
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
             r.add_answer(Record::from_rdata(
-                req.queries()[0].name().clone(),
+                req.queries[0].name().clone(),
                 300,
                 RData::A(hickory_proto::rr::rdata::A::new(1, 2, 3, 4)),
             ));
@@ -1017,7 +1031,7 @@ mod tests {
         let mut edns = Edns::new();
         edns.options_mut()
             .insert(EdnsOption::Unknown(8, vec![0, 1, 24, 0, 192, 0, 2]));
-        *q.extensions_mut() = Some(edns);
+        q.edns = Some(edns);
         let (_, sent) = run_collecting(&st, &q).await;
         assert_eq!(cache_stores(&sent), 0);
     }
@@ -1031,7 +1045,7 @@ mod tests {
             s.routing = Some(Arc::new(crate::routing::Routing::from_forwarder(f)));
         }
         let resp = run_handler(&st, &query("1.0.0.10.in-addr.arpa.", RecordType::PTR)).await;
-        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
+        assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
     }
 
     #[tokio::test]
@@ -1042,20 +1056,20 @@ mod tests {
             .rewrites
             .load(vec![("local.example".into(), "192.0.2.1".into())]);
         let mut req = query("local.example.", RecordType::A);
-        req.add_query(req.queries()[0].clone());
+        req.add_query(req.queries[0].clone());
         let resp = run_handler(&st, &req).await;
-        assert_eq!(resp.response_code(), ResponseCode::FormErr);
-        assert!(resp.answers().is_empty());
+        assert_eq!(resp.metadata.response_code, ResponseCode::FormErr);
+        assert!(resp.answers.is_empty());
     }
 
     #[tokio::test]
     async fn unsupported_opcode_is_not_forwarded() {
         let st = test_state();
         let mut req = query("example.org.", RecordType::A);
-        req.set_op_code(hickory_proto::op::OpCode::Update);
+        req.metadata.op_code = hickory_proto::op::OpCode::Update;
         let resp = run_handler(&st, &req).await;
-        assert_eq!(resp.response_code(), ResponseCode::NotImp);
-        assert!(resp.answers().is_empty());
+        assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
+        assert!(resp.answers.is_empty());
     }
 
     #[tokio::test]
@@ -1068,17 +1082,17 @@ mod tests {
                 .load("test", vec!["ads.example.com".into()]);
         }
         let resp = run_handler(&st, &query("ads.example.com.", RecordType::A)).await;
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
-        match resp.answers().first().and_then(|r| r.data()) {
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        match resp.answers.first().map(|r| &r.data) {
             Some(RData::A(a)) => assert_eq!(a.0.to_string(), "0.0.0.0"),
             other => panic!("expected 0.0.0.0 block answer, got {:?}", other),
         }
         // EDE 15 attached.
-        assert!(resp.extensions().as_ref().is_some());
+        assert!(resp.edns.as_ref().is_some());
     }
 
     fn is_zero_ip_block(resp: &Message) -> bool {
-        matches!(resp.answers().first().and_then(|r| r.data()),
+        matches!(resp.answers.first().map(|r| &r.data),
                  Some(RData::A(a)) if a.0.is_unspecified())
     }
 
@@ -1158,11 +1172,12 @@ mod tests {
                 let sock = sock.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let mut r = Message::new();
-                    r.set_id(req.id());
-                    r.set_message_type(MessageType::Response);
-                    r.add_queries(req.queries().to_vec());
-                    let name = req.queries()[0].name().clone();
+                    let mut r =
+                        Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+                    r.metadata.id = req.metadata.id;
+                    r.metadata.message_type = MessageType::Response;
+                    r.add_queries(req.queries.to_vec());
+                    let name = req.queries[0].name().clone();
                     r.add_answer(Record::from_rdata(name, 300, RData::A(A::new(1, 2, 3, 4))));
                     let _ = sock.send_to(&r.to_bytes().unwrap(), src).await;
                 });
@@ -1183,10 +1198,10 @@ mod tests {
                 };
                 let req = Message::from_bytes(&buf[..n]).unwrap();
                 let mut r = respond(&req);
-                r.set_id(req.id());
-                r.set_message_type(MessageType::Response);
-                if r.queries().is_empty() {
-                    r.add_queries(req.queries().to_vec());
+                r.metadata.id = req.metadata.id;
+                r.metadata.message_type = MessageType::Response;
+                if r.queries.is_empty() {
+                    r.add_queries(req.queries.to_vec());
                 }
                 let _ = sock.send_to(&r.to_bytes().unwrap(), src).await;
             }
@@ -1249,13 +1264,13 @@ mod tests {
     #[tokio::test]
     async fn servfail_is_neither_cached_nor_propagated() {
         let st = state_with_upstream(|_| {
-            let mut r = Message::new();
-            r.set_response_code(ResponseCode::ServFail);
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            r.metadata.response_code = ResponseCode::ServFail;
             r
         })
         .await;
         let (resp, sent) = run_collecting(&st, &query("flaky.example.", RecordType::A)).await;
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
         assert!(
             st.read().await.cache.lookup("flaky.example:1").is_none(),
             "SERVFAIL was cached"
@@ -1266,8 +1281,8 @@ mod tests {
     #[tokio::test]
     async fn refused_is_not_cached() {
         let st = state_with_upstream(|_| {
-            let mut r = Message::new();
-            r.set_response_code(ResponseCode::Refused);
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            r.metadata.response_code = ResponseCode::Refused;
             r
         })
         .await;
@@ -1279,9 +1294,9 @@ mod tests {
     async fn nxdomain_is_cached_for_the_soa_negative_ttl() {
         // RFC 2308: negative TTL = min(SOA record TTL, SOA MINIMUM).
         let st = state_with_upstream(|_| {
-            let mut r = Message::new();
-            r.set_response_code(ResponseCode::NXDomain);
-            r.add_name_server(soa("example.", 900, 120));
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            r.metadata.response_code = ResponseCode::NXDomain;
+            r.add_authority(soa("example.", 900, 120));
             r
         })
         .await;
@@ -1299,9 +1314,9 @@ mod tests {
     #[tokio::test]
     async fn nodata_uses_the_soa_negative_ttl() {
         let st = state_with_upstream(|_| {
-            let mut r = Message::new();
-            r.set_response_code(ResponseCode::NoError);
-            r.add_name_server(soa("example.", 45, 300));
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            r.metadata.response_code = ResponseCode::NoError;
+            r.add_authority(soa("example.", 45, 300));
             r
         })
         .await;
@@ -1318,8 +1333,8 @@ mod tests {
     #[tokio::test]
     async fn negative_answer_without_soa_is_not_cached() {
         let st = state_with_upstream(|_| {
-            let mut r = Message::new();
-            r.set_response_code(ResponseCode::NXDomain);
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            r.metadata.response_code = ResponseCode::NXDomain;
             r
         })
         .await;
@@ -1332,8 +1347,8 @@ mod tests {
         // 0x20 resolvers (e.g. Unbound use-caps-for-id) reject replies whose
         // question case differs from what they sent.
         let st = state_with_upstream(|req| {
-            let mut r = Message::new();
-            let name = req.queries()[0].name().clone();
+            let mut r = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
+            let name = req.queries[0].name().clone();
             r.add_answer(Record::from_rdata(
                 name,
                 300,
@@ -1350,8 +1365,8 @@ mod tests {
             ),
             "second query was not a cache hit"
         );
-        assert_eq!(second.queries()[0].name().to_ascii(), "eXaMpLe.org.");
-        assert_eq!(second.id(), 0x1234);
+        assert_eq!(second.queries[0].name().to_ascii(), "eXaMpLe.org.");
+        assert_eq!(second.metadata.id, 0x1234);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1401,8 +1416,8 @@ mod tests {
         // run_collecting's client is 192.168.1.42 — outside 10/8. No upstream
         // is configured, so any forwarding attempt would surface as SERVFAIL.
         let (resp, sent) = run_collecting(&st, &query("example.com.", RecordType::A)).await;
-        assert_eq!(resp.response_code(), ResponseCode::Refused);
-        assert!(resp.answers().is_empty());
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+        assert!(resp.answers.is_empty());
         assert!(
             sent.iter().any(
                 |m| matches!(m, WriterMessage::Event(e) if matches!(e.action, Action::Refused))
@@ -1537,7 +1552,7 @@ mod tests {
         }
         let resp = run_handler(&st, &query("nas.home.", RecordType::A)).await;
         // Rewrite wins: answers the IP, not a block.
-        match resp.answers().first().and_then(|r| r.data()) {
+        match resp.answers.first().map(|r| &r.data) {
             Some(RData::A(a)) => assert_eq!(a.0.to_string(), "192.168.1.5"),
             other => panic!("expected rewrite answer, got {:?}", other),
         }
@@ -1565,7 +1580,7 @@ mod tests {
         )
         .await;
         let resp = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
     }
 
     // ── TCP transport framing (length-prefixed, real socket) ──
@@ -1608,7 +1623,7 @@ mod tests {
 
         let resp = Message::from_bytes(&resp_buf).unwrap();
         // Blocked domain over TCP → 0.0.0.0, proving TCP framing + handler work.
-        match resp.answers().first().and_then(|r| r.data()) {
+        match resp.answers.first().map(|r| &r.data) {
             Some(RData::A(a)) => assert_eq!(a.0.to_string(), "0.0.0.0"),
             other => panic!("expected block over TCP, got {:?}", other),
         }
@@ -1616,11 +1631,11 @@ mod tests {
 
     fn query_bytes(name: &str, edns_size: Option<u16>) -> Vec<u8> {
         let mut m = query(name, RecordType::A);
-        m.set_message_type(MessageType::Query);
+        m.metadata.message_type = MessageType::Query;
         if let Some(sz) = edns_size {
             let mut e = Edns::new();
             e.set_max_payload(sz);
-            *m.extensions_mut() = Some(e);
+            m.edns = Some(e);
         }
         m.to_bytes().unwrap()
     }
@@ -1640,8 +1655,8 @@ mod tests {
         let out = truncate_for_client(&q, big);
         assert!(out.len() <= 512);
         let msg = Message::from_bytes(&out).unwrap();
-        assert!(msg.truncated());
-        assert_eq!(msg.id(), 0x1234);
+        assert!(msg.metadata.truncation);
+        assert_eq!(msg.metadata.id, 0x1234);
     }
 
     #[test]
