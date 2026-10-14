@@ -75,9 +75,10 @@ jobs:
           path: |
             ~/.cache/rebar3
             erlang/_build
-          key: rebar3-${{ hashFiles('erlang/rebar.lock') }}
-          restore-keys: rebar3-
+          key: rebar3-otp29-${{ hashFiles('erlang/rebar.lock') }}
+          restore-keys: rebar3-otp29-
       - run: rebar3 compile
+      - run: rebar3 dialyzer
       - run: rebar3 eunit
       # --sname is required: without a distributed node the two-node cluster
       # suite skips instead of running.
