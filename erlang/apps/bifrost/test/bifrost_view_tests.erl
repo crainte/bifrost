@@ -73,6 +73,11 @@ redesigned_operational_pages_use_shared_primitives_test() ->
     ?assert(binary:match(Threats, <<"id=\"t-rows\"">>) =/= nomatch),
     ?assert(binary:match(Threats, <<"id=\"t-select-all\"">>) =/= nomatch),
     ?assert(binary:match(Threats, <<"id=\"ab-preview\"">>) =/= nomatch),
+    ?assert(binary:match(Threats, <<"exact hostname shown">>) =/= nomatch),
+    ?assert(binary:match(Threats, <<"registry looked up">>) =/= nomatch),
+    ?assert(binary:match(Threats, <<"registry pending">>) =/= nomatch),
+    ?assert(binary:match(Threats, <<"registry unavailable">>) =/= nomatch),
+    ?assertEqual(nomatch, binary:match(Threats, <<"collapsed to the registrable domain">>)),
     %% No leftover Tailwind slate utilities or inline colours on redesigned pages.
     ?assertEqual(nomatch, binary:match(Threats, <<"text-slate-">>)),
     ?assertEqual(nomatch, binary:match(Blocklists, <<"color: #">>)),

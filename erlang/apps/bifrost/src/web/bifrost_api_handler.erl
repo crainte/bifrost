@@ -1,8 +1,8 @@
 -module(bifrost_api_handler).
 
 -export([init/2, push_rewrites/0, push_allowlist/0, push_manual_blocks/0, push_client_blocks/0]).
--export([score_domain/2, score_reasons/2, rdap_lookup/1, rdap_cached/1, rdap_cached/2,
-         rdap_registry/1,
+-export([score_domain/2, score_reasons/2, threat_eligible_domain/1,
+         rdap_lookup/1, rdap_cached/1, rdap_cached/2, rdap_registry/1,
          rdap_reasons/1, score_rdap/1, enrich_with_rdap/1, extract_base_domain/1]).
 
 -define(JSON, #{<<"content-type">> => <<"application/json">>}).
@@ -1030,15 +1030,15 @@ get_threat_settings() ->
 
 get_threats() ->
     case db_call(query,
-        "SELECT domain, score, reasons, hits, age_days, "
+        "SELECT domain, score, reasons, hits, age_days, rdap_lookup, "
         "  to_char(first_seen, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') "
         "FROM suspicious_candidates WHERE status = 'pending' "
         "ORDER BY score DESC, hits DESC LIMIT 200") of
         {ok, _, Rows} when is_list(Rows) ->
             [#{domain => D, score => S,
                reasons => parse_reasons(R),
-               hits => H, age_days => Age, first_seen => FS}
-             || {D, S, R, H, Age, FS} <- Rows];
+               hits => H, age_days => Age, rdap_lookup => Lookup, first_seen => FS}
+             || {D, S, R, H, Age, Lookup, FS} <- Rows];
         _ ->
             []
     end.
@@ -1171,7 +1171,7 @@ find_suspicious_domains(ClientIpTuple, Hours, Limit) when is_tuple(ClientIpTuple
         {ok, _, Rows} ->
             Scored = lists:filtermap(fun({Domain, Hits}) ->
                 Score = score_domain(Domain, Hits),
-                case Score > 0 of
+                case threat_eligible_domain(Domain) andalso Score > 0 of
                     true -> {true, #{domain => Domain, score => Score, hits => Hits,
                                      reasons => score_reasons(Domain, Hits)}};
                     false -> false
@@ -1183,6 +1183,21 @@ find_suspicious_domains(ClientIpTuple, Hours, Limit) when is_tuple(ClientIpTuple
             lists:sublist(Sorted, Limit);
         _ -> []
     end.
+
+threat_eligible_domain(Domain) when is_binary(Domain) ->
+    Parts = binary:split(Domain, <<".">>, [global, trim_all]),
+    case Parts of
+        [_, _ | _] ->
+            Tld = string:lowercase(lists:last(Parts)),
+            not lists:member(Tld, [<<"arpa">>, <<"internal">>, <<"local">>,
+                                   <<"localhost">>, <<"localdomain">>, <<"home">>,
+                                   <<"lan">>, <<"invalid">>, <<"test">>,
+                                   <<"example">>, <<"onion">>]);
+        _ ->
+            false
+    end;
+threat_eligible_domain(_) ->
+    false.
 
 score_domain(Domain, Hits) ->
     score_numbered_subdomain(Domain) +
