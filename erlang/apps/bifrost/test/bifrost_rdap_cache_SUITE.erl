@@ -183,7 +183,14 @@ enrich_path_never_contacts_the_registry(_Config) ->
     [Warm] = bifrost_api_handler:enrich_with_rdap([Candidate]),
     ?assertEqual(1 + 3, maps:get(score, Warm)),
     ?assertEqual(done, maps:get(lookup, maps:get(rdap, Warm))),
-    ?assertEqual(1, length(calls())).
+    ?assertEqual(1, length(calls())),
+
+    seed(<<"old-example.com">>, 1000, true, false, false),
+    [Old] = bifrost_api_handler:enrich_with_rdap([
+        #{domain => <<"www.old-example.com">>, score => 1, hits => 1, reasons => []}
+    ]),
+    ?assertEqual(done, maps:get(lookup, maps:get(rdap, Old))),
+    ?assertEqual([], maps:get(reasons, Old)).
 
 %% Many simultaneous page loads (and subdomain variants of the same
 %% registration) on one cold domain: exactly one registry request.

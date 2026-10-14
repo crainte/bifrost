@@ -19,6 +19,9 @@
 %%     age_days as of the lookup, so ages never advanced, and stored every failure
 %%     as a permanent all-NULL row. Migration 014 must recover registered_on from
 %%     existing rows and turn unclassifiable negatives into one due retry.
+%%  6. threat_rdap_lookup_backfills_known_results — existing candidates with a
+%%     registration age represent completed lookups; migration 015 records that
+%%     state while leaving unknown rows unavailable.
 %%
 %% Requires a reachable Postgres. Connection is taken from env so the same suite
 %% runs in CI/dev:
@@ -41,7 +44,8 @@
          concurrent_runners_apply_each_migration_once/1,
          failed_migration_rolls_back_and_records_nothing/1,
          migration_record_uses_bound_parameters/1,
-         rdap_cache_backfill_unfreezes_age_and_retries_unknowns/1]).
+         rdap_cache_backfill_unfreezes_age_and_retries_unknowns/1,
+         threat_rdap_lookup_backfills_known_results/1]).
 
 -define(RUNNERS, 4).
 
@@ -49,8 +53,9 @@ all() ->
     [applied_migrations_are_not_reapplied,
      concurrent_runners_apply_each_migration_once,
      failed_migration_rolls_back_and_records_nothing,
-     migration_record_uses_bound_parameters,
-     rdap_cache_backfill_unfreezes_age_and_retries_unknowns].
+      migration_record_uses_bound_parameters,
+      rdap_cache_backfill_unfreezes_age_and_retries_unknowns,
+      threat_rdap_lookup_backfills_known_results].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(epgsql),
@@ -211,6 +216,28 @@ rdap_cache_backfill_unfreezes_age_and_retries_unknowns(Config) ->
                          " WHERE domain = 'negative.example'")),
     %% The CHECK constraint is in place.
     ?assertMatch({error, _}, epgsql:squery(C, "UPDATE rdap_cache SET status = 'bogus'")),
+    ok = epgsql:close(C).
+
+%% ── 6: threat RDAP lookup state (015) ─────────────────────────
+threat_rdap_lookup_backfills_known_results(Config) ->
+    C = connect(Config, new_schema(Config, "threat015")),
+    RealDir = filename:join(code:priv_dir(bifrost), "migrations"),
+    {Before, [Target]} = lists:partition(
+        fun(F) -> F < "015" end,
+        [F || F <- lists:sort(real_migration_files()), F < "016"]),
+    ?assertEqual("015_threat_rdap_lookup.sql", Target),
+    Read = fun(F) -> {ok, B} = file:read_file(filename:join(RealDir, F)), {F, B} end,
+    with_migration_dir(Config, "threat015", [Read(F) || F <- Before],
+                       fun() -> ok = bifrost_migrations:run(C) end),
+    sq(C, "INSERT INTO suspicious_candidates (domain, score, age_days) VALUES"
+          " ('known.example', 3, 42), ('unknown.example', 3, NULL)"),
+    with_migration_dir(Config, "threat015", [Read(Target)],
+                       fun() -> ok = bifrost_migrations:run(C) end),
+    ?assertEqual([{<<"known.example">>, <<"done">>},
+                  {<<"unknown.example">>, <<"unavailable">>}],
+                 rows(C, "SELECT domain, rdap_lookup FROM suspicious_candidates ORDER BY domain")),
+    ?assertMatch({error, _}, epgsql:squery(
+        C, "UPDATE suspicious_candidates SET rdap_lookup = 'bogus'")),
     ok = epgsql:close(C).
 
 %% ── helpers ───────────────────────────────────────────────────

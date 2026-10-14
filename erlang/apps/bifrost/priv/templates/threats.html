@@ -9,7 +9,7 @@
 
     <section id="sec-queue" class="st-section" aria-labelledby="queue-title">
       <header class="st-section__head">
-        <div><h2 id="queue-title">Review queue</h2><p>Likely ad or throwaway domains seen in forwarded traffic, collapsed to the registrable domain. Blocking covers every subdomain; dismissing marks the domain safe.</p></div>
+        <div><h2 id="queue-title">Review queue</h2><p>Likely ad or throwaway hostnames seen in forwarded traffic. Blocking or dismissing applies to the exact hostname shown; registration data is shared at the registrable-domain scope.</p></div>
         <div class="st-section__actions"><button type="button" id="t-scan" class="btn btn-secondary btn-sm">Scan now</button></div>
       </header>
       <div class="st-toolbar">
@@ -70,7 +70,7 @@
         <div class="st-row__label"><h3>Signal sources</h3><p>Shown as tags on each candidate.</p></div>
         <div class="st-row__control"><dl class="st-switches">
           <div class="st-tile"><dt><span class="tag">Bifrost signal</span></dt><dd>Bifrost's own analysis of the name and traffic pattern: random-looking labels, numbered subdomains, query bursts.</dd></div>
-          <div class="st-tile"><dt><span class="tag tag-rdap">Registry signal</span></dt><dd>RDAP facts such as registration age or pending deletion. Looked up once per registrable domain and cached.</dd></div>
+          <div class="st-tile"><dt><span class="tag tag-rdap">Registry signal</span></dt><dd>RDAP facts such as registration age or pending deletion. Looked up once per registrable domain and cached; lookup status is shown even when no adverse signal is found.</dd></div>
         </dl></div>
       </div>
     </section>
@@ -138,6 +138,8 @@
       var c4 = make('td', null, Number(t.hits || 0).toLocaleString()); c4.style.textAlign = 'right';
       var c5 = make('td'); c5.style.textAlign = 'right';
       c5.appendChild(t.age_days == null ? make('span', 'section-kicker', 'unknown') : make('span', 'pill ' + (t.age_days < 30 ? 'pill-danger' : t.age_days < 90 ? 'pill-warn' : 'pill-muted'), t.age_days >= 730 ? Math.floor(t.age_days / 365) + 'y' : t.age_days + 'd'));
+      var lookup = t.rdap_lookup || 'unavailable', lookupText = lookup === 'done' ? 'registry looked up' : lookup === 'pending' ? 'registry pending' : 'registry unavailable';
+      c5.appendChild(make('small', 'section-kicker', lookupText));
       var c6 = make('td'), acts = make('div', 't-actions'), dismiss = make('button', 'btn btn-ghost btn-sm', 'Dismiss'), blk = make('button', 'btn btn-danger btn-sm', 'Block');
       dismiss.type = blk.type = 'button';
       dismiss.onclick = function () { act([t.domain], 'dismiss'); };

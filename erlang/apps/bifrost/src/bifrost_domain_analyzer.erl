@@ -25,7 +25,7 @@
 -export([start_link/0, scan_now/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 %% spawn_monitor/3 target; the domain_analyzer_scan env can replace it (tests).
--export([run_scan/0]).
+-export([run_scan/0, rank_candidates/1]).
 
 -define(SCAN_INTERVAL, 15 * 60 * 1000).  %% 15 minutes
 -define(FIRST_SCAN_DELAY, 60 * 1000).    %% 1 min after boot (let traffic accrue)
@@ -175,43 +175,23 @@ find_candidates() ->
           "GROUP BY domain ORDER BY hits DESC LIMIT 2000",
     case bifrost_db_pool:equery(Sql, [integer_to_list(?WINDOW_HOURS)]) of
         {ok, _, Rows} ->
-            Scored = lists:filtermap(fun({Domain, Hits}) ->
-                Score = bifrost_api_handler:score_domain(Domain, Hits),
-                case Score >= ?SCORE_THRESHOLD of
-                    true ->
-                        {true, #{domain => Domain, score => Score, hits => Hits,
-                                 reasons => bifrost_api_handler:score_reasons(Domain, Hits)}};
-                    false -> false
-                end
-            end, Rows),
-            %% Collapse numbered/subdomain families to their registrable base so
-            %% the operator blocks one domain (subtree-greedy) instead of every
-            %% N.<domain> variant. Aggregate hits, union reasons, keep max score.
-            Grouped = collapse_by_base(Scored),
-            lists:sort(fun(A, B) -> maps:get(score, A) >= maps:get(score, B) end, Grouped);
+            rank_candidates(Rows);
         _ ->
             []
     end.
 
-%% Fold scored candidates into one per registrable base domain.
-collapse_by_base(Scored) ->
-    Map = lists:foldl(fun(C, Acc) ->
-        Base = bifrost_api_handler:extract_base_domain(maps:get(domain, C)),
-        case maps:find(Base, Acc) of
-            {ok, Existing} ->
-                Merged = #{
-                    domain  => Base,
-                    score   => max(maps:get(score, Existing), maps:get(score, C)),
-                    hits    => maps:get(hits, Existing) + maps:get(hits, C),
-                    reasons => lists:usort(maps:get(reasons, Existing) ++ maps:get(reasons, C))
-                },
-                Acc#{Base => Merged};
-            error ->
-                Acc#{Base => C#{domain => Base,
-                                reasons => lists:usort(maps:get(reasons, C))}}
+rank_candidates(Rows) ->
+    Scored = lists:filtermap(fun({Domain, Hits}) ->
+        Score = bifrost_api_handler:score_domain(Domain, Hits),
+        case bifrost_api_handler:threat_eligible_domain(Domain)
+             andalso Score >= ?SCORE_THRESHOLD of
+            true ->
+                {true, #{domain => Domain, score => Score, hits => Hits,
+                         reasons => bifrost_api_handler:score_reasons(Domain, Hits)}};
+            false -> false
         end
-    end, #{}, Scored),
-    maps:values(Map).
+    end, Rows),
+    lists:sort(fun(A, B) -> maps:get(score, A) >= maps:get(score, B) end, Scored).
 
 %% Enrich a candidate with out-of-band signals: RDAP registry data and a header
 %% probe (CORS/CSP). Both cached — a client already fetched this domain, so a HEAD
@@ -236,6 +216,7 @@ enrich(#{domain := Domain} = C) ->
     {ProbeScore, ProbeReasons} = header_probe(Domain),
     C#{
         age_days => maps:get(age_days, Rdap, undefined),
+        rdap_lookup => maps:get(lookup, Rdap, unavailable),
         score => maps:get(score, C)
                  + ProbeScore
                  + bifrost_api_handler:score_rdap(Rdap),
@@ -299,13 +280,18 @@ cache_probe(Domain, Cors, Csp) ->
 %% find_candidates already excludes them, and ON CONFLICT only bumps a pending).
 upsert_candidate(#{domain := Domain, score := Score, hits := Hits, reasons := Reasons} = C) ->
     Age = maps:get(age_days, C, undefined),
+    Lookup = atom_to_binary(maps:get(rdap_lookup, C, unavailable)),
     ReasonsJson = jsx:encode(Reasons),
     bifrost_db_pool:equery(
-        "INSERT INTO suspicious_candidates (domain, score, reasons, hits, age_days, updated_at) "
-        "VALUES ($1, $2, $3::jsonb, $4, $5, now()) "
+        "INSERT INTO suspicious_candidates "
+        "  (domain, score, reasons, hits, age_days, rdap_lookup, updated_at) "
+        "VALUES ($1, $2, $3::jsonb, $4, $5, $6, now()) "
         "ON CONFLICT (domain) DO UPDATE SET "
         "  score = $2, reasons = $3::jsonb, hits = $4, "
-        "  age_days = COALESCE($5, suspicious_candidates.age_days), updated_at = now() "
+        "  age_days = COALESCE($5, suspicious_candidates.age_days), "
+        "  rdap_lookup = CASE WHEN $6 = 'unavailable' "
+        "    AND suspicious_candidates.rdap_lookup = 'done' THEN 'done' ELSE $6 END, "
+        "  updated_at = now() "
         "WHERE suspicious_candidates.status = 'pending'",
-        [Domain, Score, ReasonsJson, Hits, Age]),
+        [Domain, Score, ReasonsJson, Hits, Age, Lookup]),
     ok.
