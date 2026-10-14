@@ -82,5 +82,4 @@ do_warm() ->
         Class:Reason -> logger:warning("ptr warm failed: ~p:~p", [Class, Reason])
     end.
 
-cancel(undefined) -> ok;
 cancel(Ref) -> erlang:cancel_timer(Ref).

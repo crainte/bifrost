@@ -239,5 +239,4 @@ parse_ip(Bin) when is_binary(Bin) ->
     case inet:parse_address(binary_to_list(Bin)) of
         {ok, Tuple} -> Tuple;
         {error, _} -> error
-    end;
-parse_ip(_) -> error.
+    end.

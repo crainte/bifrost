@@ -966,7 +966,6 @@ singleton_job(Name, GlobalName, Interval, Coordination) ->
                 end,
       leader => case Node of undefined -> null; N2 -> atom_to_binary(N2, utf8) end}.
 
-human_interval(S) when S < 60 -> [integer_to_binary(S), <<"s">>];
 human_interval(S) when S < 3600 -> [integer_to_binary(S div 60), <<"m">>];
 human_interval(S) -> [integer_to_binary(S div 3600), <<"h">>].
 

@@ -71,7 +71,7 @@ format_log_row(#{client_ip := ClientIp, domain := Domain, qtype := Qtype,
     end,
     QtypeName = qtype_name(Qtype),
     DisplayAction = friendly_action(Action),
-    ActionAttr = case Action of undefined -> <<"">>; null -> <<"">>; _ -> escape_h(Action) end,
+    ActionAttr = case Action of undefined -> <<"">>; _ -> escape_h(Action) end,
     Id = integer_to_binary(maps:get(id, Entry)),
     DetailId = <<"query-detail-", Id/binary>>,
     Client = case ClientNameE of

@@ -9,6 +9,7 @@
         crypto,
         inets,
         ssl,
+        mnesia,
         cowboy,
         jsx,
         epgsql
