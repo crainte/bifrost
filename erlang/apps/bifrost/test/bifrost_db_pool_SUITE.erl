@@ -15,11 +15,13 @@
 
 -export([all/0, init_per_suite/1, end_per_suite/1]).
 -export([connects_via_env_password/1, query_returns_rows/1,
-         equery_binds_params/1, migrations_created_schema/1]).
+          equery_binds_params/1, migrations_created_schema/1,
+          ptr_warmer_selects_missing_and_stale_entries/1]).
 
 all() ->
     [connects_via_env_password, query_returns_rows,
-     equery_binds_params, migrations_created_schema].
+     equery_binds_params, migrations_created_schema,
+     ptr_warmer_selects_missing_and_stale_entries].
 
 init_per_suite(Config) ->
     application:ensure_all_started(crypto),
@@ -91,7 +93,38 @@ migrations_created_schema(_Config) ->
         "SELECT value FROM settings WHERE key = $1", [<<"ptr_ttl_seconds">>]),
     ?assertEqual(<<"21600">>, Val).
 
+ptr_warmer_selects_missing_and_stale_entries(_Config) ->
+    Key = {bifrost_dns_settings_server, effective},
+    persistent_term:put(Key, #{settings => #{<<"reverse_dns">> => #{
+        <<"enrichment_enabled">> => true,
+        <<"resolvers">> => [#{<<"address">> => <<"127.0.0.1">>, <<"port">> => 53}],
+        <<"positive_ttl_seconds">> => 60, <<"negative_ttl_seconds">> => 5}}}),
+    try
+        {ok, _} = bifrost_db_pool:query("DELETE FROM ptr_cache"),
+        {ok, _} = bifrost_db_pool:query("DELETE FROM query_log"),
+        _ = bifrost_query_writer:maintain_partitions(undefined),
+        {ok, _} = bifrost_db_pool:equery(
+            "INSERT INTO query_log (client_ip, domain, qtype, action, client_rcode) VALUES "
+            "($1, 'missing.example', 1, 'NOERROR', 'NOERROR'), "
+            "($2, 'stale-positive.example', 1, 'NOERROR', 'NOERROR'), "
+            "($3, 'fresh-positive.example', 1, 'NOERROR', 'NOERROR'), "
+            "($4, 'stale-negative.example', 1, 'NOERROR', 'NOERROR')",
+            [ip(1), ip(2), ip(3), ip(4)]),
+        Provenance = bifrost_ptr:visible_provenance(),
+        {ok, _} = bifrost_db_pool:equery(
+            "INSERT INTO ptr_cache (ip, name, looked_up, provenance) VALUES "
+            "($1, 'stale', now() - interval '61 seconds', $4), "
+            "($2, 'fresh', now() - interval '59 seconds', $4), "
+            "($3, NULL, now() - interval '6 seconds', $4)",
+            [ip(2), ip(3), ip(4), Provenance]),
+        ?assertEqual({ok, 3}, bifrost_ptr:warm())
+    after
+        persistent_term:erase(Key)
+    end.
+
 %% ── helpers ───────────────────────────────────────────────────
+
+ip(N) -> {192, 0, 2, N}.
 
 getenv(Var, Default) ->
     case os:getenv(Var) of false -> Default; "" -> Default; V -> V end.
