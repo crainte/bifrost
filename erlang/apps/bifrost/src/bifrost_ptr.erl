@@ -159,7 +159,7 @@ warm() ->
                   "WHERE q.queried_at >= now() - interval '24 hours' "
                   "  AND (p.ip IS NULL OR p.provenance <> $2 OR "
                   "       EXTRACT(EPOCH FROM (now() - p.looked_up)) >= "
-                  "       CASE WHEN p.name IS NULL THEN $3 ELSE $1 END) "
+                   "       CASE WHEN p.name IS NULL THEN $3::bigint ELSE $1::bigint END) "
                   "LIMIT " ++ integer_to_list(?WARM_LIMIT),
             {Positive, Negative} = ttl_seconds(),
             case bifrost_db_pool:equery(Sql, [Positive, provenance(), Negative]) of
