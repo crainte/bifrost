@@ -25,7 +25,8 @@
          settings_api_is_safe_and_revisioned/1,
          client_blocks_are_listed/1,
          clients_report_last_seen/1,
-         query_log_and_clients_share_the_dashboard_window/1]).
+         query_log_and_clients_share_the_dashboard_window/1,
+         campaign_dismissal_expires_and_is_client_scoped/1]).
 
 -define(PORT, 18123).
 
@@ -43,7 +44,8 @@ all() ->
      settings_api_is_safe_and_revisioned,
      client_blocks_are_listed,
      clients_report_last_seen,
-     query_log_and_clients_share_the_dashboard_window].
+     query_log_and_clients_share_the_dashboard_window,
+     campaign_dismissal_expires_and_is_client_scoped].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -101,7 +103,8 @@ end_per_suite(Config) ->
 
 init_per_testcase(_TC, Config) ->
     [sql(Config, "DELETE FROM " ++ T)
-     || T <- ["manual_blocks", "allowlist", "client_blocks", "rewrites", "suspicious_candidates"]],
+     || T <- ["manual_blocks", "allowlist", "client_blocks", "rewrites", "suspicious_candidates",
+              "threat_suppressions"]],
     Config.
 
 %% ── cases ─────────────────────────────────────────────────────
@@ -252,6 +255,66 @@ invalid_domains_are_rejected(Config) ->
     ?assertEqual(400, post("/api/threats/block", #{domain => <<"a b">>})),
     ?assertEqual(400, post("/api/rewrites", #{domain => <<"x y">>, target => <<"1.2.3.4">>})),
     ?assertEqual([], col(Config, "SELECT domain FROM manual_blocks UNION ALL SELECT domain FROM allowlist")).
+
+%% Through the production HTTP path AND the analyzer's candidate query: a
+%% campaign dismissal hides only the chosen client's matching traffic, never
+%% touches DNS policy, and stops applying once revoked or expired.
+campaign_dismissal_expires_and_is_client_scoped(Config) ->
+    sql(Config, "CREATE TABLE IF NOT EXISTS query_log_dashboard_test PARTITION OF query_log DEFAULT"),
+    sql(Config, "DELETE FROM query_log WHERE domain LIKE '%.site'"),
+    Log = fun(Ip, D) ->
+        sql(Config, "INSERT INTO query_log (client_ip, domain, qtype, action, client_rcode) VALUES ('"
+                    ++ Ip ++ "', '" ++ D ++ "', 1, 'NOERROR', 'NOERROR')")
+    end,
+    Own = ["447.alpha.site", "447.beta.site", "447.gamma.site"],
+    [Log("10.10.10.250", D) || D <- Own],
+    Log("10.10.10.250", "447.shared.site"),
+    Log("10.10.10.9", "447.shared.site"),
+    sql(Config, "INSERT INTO suspicious_candidates (domain, score, hits) VALUES "
+                "('447.alpha.site', 4, 1), ('447.beta.site', 4, 1), "
+                "('447.gamma.site', 4, 1), ('447.shared.site', 4, 2), ('api.alpha.site', 4, 1)"),
+
+    {200, #{<<"campaigns">> := [Campaign], <<"suppressions">> := []}} =
+        json_request(get, "/api/threats/campaigns", none),
+    ?assertMatch(#{<<"pattern">> := <<"447.*.site">>, <<"domain_count">> := 4,
+                   <<"clients">> := [#{<<"ip">> := <<"10.10.10.250">>, <<"queries">> := 4} | _]},
+                 Campaign),
+
+    {400, _} = json_request(post, "/api/threats/campaigns/dismiss",
+                            #{tld => <<"site">>, leading_label => <<"api">>}),
+    {200, #{<<"dismissed">> := 3, <<"id">> := Id}} =
+        json_request(post, "/api/threats/campaigns/dismiss",
+                     #{tld => <<"site">>, leading_label => <<"447">>,
+                       client_ip => <<"10.10.10.250">>, days => 30}),
+    ?assertEqual([<<"447.alpha.site">>, <<"447.beta.site">>, <<"447.gamma.site">>],
+                 col(Config, "SELECT domain FROM suspicious_candidates WHERE status = 'dismissed'")),
+    ?assertEqual([<<"447.shared.site">>, <<"api.alpha.site">>],
+                 col(Config, "SELECT domain FROM suspicious_candidates WHERE status = 'pending'")),
+    ?assertEqual([], col(Config, "SELECT domain FROM allowlist UNION ALL SELECT domain FROM manual_blocks")),
+
+    %% New campaign traffic: hidden for the scoped client, still seen for others.
+    Log("10.10.10.250", "447.delta.site"),
+    Log("10.10.10.9", "447.epsilon.site"),
+    Found = fun() -> [maps:get(domain, C) || C <- bifrost_domain_analyzer:find_candidates()] end,
+    ?assertNot(lists:member(<<"447.delta.site">>, Found())),
+    ?assert(lists:member(<<"447.epsilon.site">>, Found())),
+    %% Shared hostname counts only the unscoped client's hit.
+    [Shared] = [C || C <- bifrost_domain_analyzer:find_candidates(),
+                     maps:get(domain, C) =:= <<"447.shared.site">>],
+    ?assertEqual(1, maps:get(hits, Shared)),
+
+    {200, #{<<"suppressions">> := [#{<<"matched_domains">> := 3}]}} =
+        json_request(get, "/api/threats/campaigns", none),
+    sql(Config, "UPDATE threat_suppressions SET created_at = now() - interval '31 days', "
+                "expires_at = now() - interval '1 second'"),
+    ?assert(lists:member(<<"447.delta.site">>, Found())),
+    {200, #{<<"suppressions">> := []}} = json_request(get, "/api/threats/campaigns", none),
+
+    sql(Config, "UPDATE threat_suppressions SET expires_at = now() + interval '1 day'"),
+    ?assertNot(lists:member(<<"447.delta.site">>, Found())),
+    ?assertEqual(200, post("/api/threats/suppressions/revoke", #{id => Id})),
+    ?assertEqual(404, post("/api/threats/suppressions/revoke", #{id => Id})),
+    ?assert(lists:member(<<"447.delta.site">>, Found())).
 
 %% ── helpers ───────────────────────────────────────────────────
 

@@ -179,6 +179,36 @@ handle_request(<<"POST">>, Req0, [threats_dismiss]) ->
         _ -> respond(400, #{error => <<"missing domain">>}, Req0)
     end;
 
+handle_request(<<"GET">>, Req0, [threat_campaigns]) ->
+    respond(200, bifrost_threat_campaigns:list(), Req0);
+
+handle_request(<<"POST">>, Req0, [threat_campaigns_dismiss]) ->
+    {ok, Body, _} = cowboy_req:read_body(Req0),
+    case decode_json(Body) of
+        Map when is_map(Map) ->
+            case bifrost_threat_campaigns:validate_dismissal(Map) of
+                {ok, Dismissal} ->
+                    case bifrost_threat_campaigns:dismiss(Dismissal) of
+                        {ok, Result} -> respond(200, Result#{ok => true}, Req0);
+                        {error, _} -> respond(500, #{error => <<"db error">>}, Req0)
+                    end;
+                {error, Reason} -> respond(400, #{error => Reason}, Req0)
+            end;
+        _ -> respond(400, #{error => <<"invalid body">>}, Req0)
+    end;
+
+handle_request(<<"POST">>, Req0, [threat_suppressions_revoke]) ->
+    {ok, Body, _} = cowboy_req:read_body(Req0),
+    case decode_json(Body) of
+        #{<<"id">> := Id} ->
+            case bifrost_threat_campaigns:revoke(Id) of
+                ok -> respond(200, #{ok => true}, Req0);
+                {error, not_found} -> respond(404, #{error => <<"not found">>}, Req0);
+                {error, _} -> respond(500, #{error => <<"db error">>}, Req0)
+            end;
+        _ -> respond(400, #{error => <<"missing id">>}, Req0)
+    end;
+
 handle_request(<<"POST">>, Req0, [threats_scan]) ->
     bifrost_domain_analyzer:scan_now(),
     respond(200, #{ok => true}, Req0);
@@ -1041,6 +1071,9 @@ get_threats() ->
         _ ->
             []
     end.
+
+decode_json(Body) ->
+    try jsx:decode(Body, [return_maps]) catch _:_ -> invalid end.
 
 parse_reasons(null) -> [];
 parse_reasons(undefined) -> [];
