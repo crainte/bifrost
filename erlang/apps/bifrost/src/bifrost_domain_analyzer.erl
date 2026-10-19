@@ -25,7 +25,7 @@
 -export([start_link/0, scan_now/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 %% spawn_monitor/3 target; the domain_analyzer_scan env can replace it (tests).
--export([run_scan/0, rank_candidates/1]).
+-export([run_scan/0, find_candidates/0, rank_candidates/1]).
 
 -define(SCAN_INTERVAL, 15 * 60 * 1000).  %% 15 minutes
 -define(FIRST_SCAN_DELAY, 60 * 1000).    %% 1 min after boot (let traffic accrue)
@@ -165,14 +165,16 @@ setting_int(Key, Default) ->
     end.
 
 %% Pull distinct forwarded domains in the window, score them, keep high scorers
-%% that aren't already blocked or dismissed.
+%% that aren't already blocked or dismissed, or covered by an active campaign
+%% suppression (bifrost_threat_campaigns).
 find_candidates() ->
-    Sql = "SELECT domain, COUNT(*) AS hits "
-          "FROM query_log "
-          "WHERE queried_at > now() - ($1 || ' hours')::interval "
-          "  AND action NOT IN ('BIFROST_BLOCK','BIFROST_CACHE') "
-          "  AND domain NOT IN (SELECT domain FROM suspicious_candidates WHERE status IN ('blocked','dismissed')) "
-          "GROUP BY domain ORDER BY hits DESC LIMIT 2000",
+    Sql = "SELECT q.domain, COUNT(*) AS hits "
+          "FROM query_log q "
+          "WHERE q.queried_at > now() - ($1 || ' hours')::interval "
+          "  AND q.action NOT IN ('BIFROST_BLOCK','BIFROST_CACHE') "
+          "  AND q.domain NOT IN (SELECT domain FROM suspicious_candidates WHERE status IN ('blocked','dismissed')) "
+          "  AND NOT " ++ bifrost_threat_campaigns:suppressed_sql("q.domain", "q.client_ip") ++ " "
+          "GROUP BY q.domain ORDER BY hits DESC LIMIT 2000",
     case bifrost_db_pool:equery(Sql, [integer_to_list(?WINDOW_HOURS)]) of
         {ok, _, Rows} ->
             rank_candidates(Rows);
