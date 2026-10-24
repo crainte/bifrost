@@ -134,10 +134,16 @@ deny(Req, _Path) ->
     end.
 
 reply_unauthorized(Req) ->
-    cowboy_req:reply(401,
-        #{<<"content-type">> => <<"application/json">>,
-          <<"www-authenticate">> => <<"Basic realm=\"bifrost\"">>},
-        jsx:encode(#{error => <<"unauthorized">>}), Req).
+    %% A Basic challenge on fetch() makes browsers open their native sign-in
+    %% dialog. Browser fetches get a plain 401; API clients still get the
+    %% challenge so HTTP Basic remains discoverable outside the web UI.
+    Headers = case cowboy_req:header(<<"sec-fetch-mode">>, Req) of
+        <<"cors">> -> #{<<"content-type">> => <<"application/json">>};
+        <<"same-origin">> -> #{<<"content-type">> => <<"application/json">>};
+        _ -> #{<<"content-type">> => <<"application/json">>,
+               <<"www-authenticate">> => <<"Basic realm=\"bifrost\"">>}
+    end,
+    cowboy_req:reply(401, Headers, jsx:encode(#{error => <<"unauthorized">>}), Req).
 
 reply_json(Req, Code, Body) ->
     cowboy_req:reply(Code,
