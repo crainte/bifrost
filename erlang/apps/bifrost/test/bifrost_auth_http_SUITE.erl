@@ -12,7 +12,8 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 -export([health_is_exempt/1, static_assets_are_exempt/1,
-          gated_api_401_without_auth/1, gated_page_redirects_to_login/1, login_bad_creds_no_cookie/1,
+          gated_api_401_without_auth/1, expired_browser_fetch_has_no_basic_challenge/1,
+          gated_page_redirects_to_login/1, login_bad_creds_no_cookie/1,
          login_good_creds_sets_cookie/1, cookie_grants_access/1,
          basic_auth_grants_api/1, logout_clears_cookie/1,
          unconfigured_fails_closed/1,
@@ -30,6 +31,7 @@
 
 all() ->
     [health_is_exempt, static_assets_are_exempt, gated_api_401_without_auth,
+     expired_browser_fetch_has_no_basic_challenge,
      gated_page_redirects_to_login, login_bad_creds_no_cookie, login_good_creds_sets_cookie, cookie_grants_access,
      basic_auth_grants_api, logout_clears_cookie, unconfigured_fails_closed,
      login_over_https_sets_secure_cookie, login_over_plain_http_has_no_secure_flag,
@@ -99,6 +101,25 @@ gated_api_401_without_auth(_) ->
     {Code, H, _B} = req(get, "/api/thing", [], undefined),
     ?assertEqual(401, Code),
     ?assertMatch("Basic" ++ _, proplists:get_value("www-authenticate", H, "")).
+
+%% A browser fetch with an expired cookie must not trigger the browser's native
+%% Basic auth modal; it needs a plain 401 so the UI can navigate to /login.
+expired_browser_fetch_has_no_basic_challenge(_) ->
+    Expired = binary_to_list(bifrost_auth:make_token(0)),
+    Headers = [{"cookie", "bifrost_session=" ++ Expired},
+               {"sec-fetch-mode", "cors"}],
+    {Code, H, _B} = req(get, "/api/thing", Headers, undefined),
+    ?assertEqual(401, Code),
+    ?assertEqual(undefined, proplists:get_value("www-authenticate", H)),
+    {PostCode, PostH, _} = req(post, "/api/thing",
+                               [{"content-type", "application/json"} | Headers], "{}"),
+    ?assertEqual(401, PostCode),
+    ?assertEqual(undefined, proplists:get_value("www-authenticate", PostH)),
+    {SameOriginCode, SameOriginH, _} =
+        req(get, "/api/thing", [{"cookie", "bifrost_session=" ++ Expired},
+                                {"sec-fetch-mode", "same-origin"}], undefined),
+    ?assertEqual(401, SameOriginCode),
+    ?assertEqual(undefined, proplists:get_value("www-authenticate", SameOriginH)).
 
 %% A gated PAGE without auth redirects to /login (302), not a 401.
 gated_page_redirects_to_login(_) ->

@@ -8,6 +8,17 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="/static/bifrost.css">
 <script>try{if(localStorage.getItem('bifrost.sidebar')==='collapsed')document.documentElement.classList.add('sidebar-collapsed')}catch(e){}</script>
+<script data-auth-redirect>
+(function() {
+  var originalFetch = window.fetch;
+  window.fetch = function() {
+    return originalFetch.apply(this, arguments).then(function(response) {
+      if (response.status === 401) location.replace('/login');
+      return response;
+    });
+  };
+})();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
