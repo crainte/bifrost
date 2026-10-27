@@ -1251,13 +1251,22 @@ score_candidate(Domain, Hits, Ctx) ->
 %% 0.gravatar.com) has one. So it also takes two INDEPENDENT positive signals.
 %% Negative terms (rdap:established, widespread) lower the score but never count
 %% as signals, and tags (no_csp, single_client, ...) count for nothing.
+%%
+%% The exception is cname_to_blocked: the answer aliases into a name the
+%% blocklists already block, which Rust now blocks at resolution. A queued one
+%% was answered before that (history, a list enabled later, an older pod), and
+%% no amount of popularity or registration age makes it less of a tracker, so
+%% it qualifies whatever the negative terms say.
 -spec qualifies(map()) -> boolean().
 qualifies(#{domain := Domain, score := Score, reasons := Reasons}) ->
     threat_eligible_domain(Domain)
-        andalso Score >= ?SCORE_THRESHOLD
-        andalso signal_weight(Reasons) >= 2;
+        andalso (cname_blocked(Reasons)
+                 orelse (Score >= ?SCORE_THRESHOLD andalso signal_weight(Reasons) >= 2));
 qualifies(_) ->
     false.
+
+cname_blocked(Reasons) ->
+    lists:any(fun(<<"cname_to_blocked:", _/binary>>) -> true; (_) -> false end, Reasons).
 
 -spec signal_weight([binary()]) -> non_neg_integer().
 signal_weight(Reasons) ->

@@ -300,12 +300,17 @@ async fn handle_query(
         }
     }
 
+    // CNAME cloaking check on the answer (see blocked_cname): only while
+    // filtering, and never for an allowlisted query name, which is how an
+    // operator unblocks a cloaked name from the query log.
+    let mut check_cnames = protection_enabled;
     if protection_enabled {
         let s = state.read().await;
         // Allowlist takes precedence over blocklist: a match bypasses blocking
         // (emit BIFROST_ALLOW, fall through to cache/forward for a real answer).
         let allowed = s.allowlist.contains(domain_trimmed);
         if allowed {
+            check_cnames = false;
             drop(s);
             if let Err(e) = event_tx.try_send(WriterMessage::Event(QueryEvent::new(
                 src.ip().to_string(),
@@ -362,8 +367,31 @@ async fn handle_query(
         if let Some((cached, remaining_ttl)) =
             cache_key.as_ref().and_then(|key| s.cache.lookup(key))
         {
+            let cached_msg = Message::from_bytes(&cached).ok();
+            // Checked on hits too: an answer cached before its target was
+            // listed, or propagated from a peer, must not bypass the block.
+            if check_cnames {
+                if let Some(msg) = cached_msg.as_ref() {
+                    if let Some((target, list_id)) = blocked_cname(msg, &s.blocklist, &s.allowlist)
+                    {
+                        drop(s);
+                        return cname_block(
+                            &request,
+                            mode,
+                            msg,
+                            src,
+                            domain_trimmed,
+                            qtype,
+                            &target,
+                            list_id,
+                            event_tx,
+                        );
+                    }
+                }
+            }
             let mut response = cached.clone();
-            let cached_rcode = Message::from_bytes(&cached)
+            let cached_rcode = cached_msg
+                .as_ref()
                 .map(|m| action_from_rcode(m.metadata.response_code))
                 .unwrap_or(Action::Unknown);
             let id_bytes = request.metadata.id.to_be_bytes();
@@ -453,6 +481,28 @@ async fn handle_query(
     };
 
     let upstream_msg = Message::from_bytes(&upstream_response).ok();
+    // Before caching: a cloaked answer is never cached or propagated.
+    if check_cnames {
+        if let Some(msg) = upstream_msg.as_ref() {
+            let hit = {
+                let s = state.read().await;
+                blocked_cname(msg, &s.blocklist, &s.allowlist)
+            };
+            if let Some((target, list_id)) = hit {
+                return cname_block(
+                    &request,
+                    mode,
+                    msg,
+                    src,
+                    domain_trimmed,
+                    qtype,
+                    &target,
+                    list_id,
+                    event_tx,
+                );
+            }
+        }
+    }
     if let (Some(ttl), Some(cache_key)) = (upstream_msg.as_ref().and_then(cache_ttl), cache_key) {
         let inserted = {
             let mut s = state.write().await;
@@ -502,6 +552,68 @@ async fn handle_query(
     debug!(client=%src.ip(), domain=%domain_trimmed, qtype, latency=%latency_us, "forwarded");
 
     Ok(upstream_response)
+}
+
+/// CNAME cloaking: a tracker served behind a first-party name
+/// (metrics.shop.com CNAME c1.tracker.net). Returns `(target, list_id)` for the
+/// first CNAME target in the answer that the blocklist (including manual
+/// blocks, which load as the `manual` list) covers, with the same semantics as
+/// the query check: most specific entry, same-list `@@` exceptions honoured,
+/// and an allowlisted target is never blocked. Per-client blocks are not
+/// applied to targets, so a cached answer means the same for every client.
+fn blocked_cname(
+    msg: &Message,
+    blocklist: &crate::blocklist::Blocklist,
+    allowlist: &crate::allowlist::Allowlist,
+) -> Option<(String, String)> {
+    msg.answers.iter().find_map(|r| match &r.data {
+        RData::CNAME(c) => {
+            let target = c.0.to_ascii().to_ascii_lowercase();
+            let target = target.trim_end_matches('.');
+            if allowlist.contains(target) {
+                return None;
+            }
+            blocklist
+                .contains(target)
+                .map(|id| (target.to_string(), id.to_string()))
+        }
+        _ => None,
+    })
+}
+
+/// The configured block response for a cloaked answer. Logged as an ordinary
+/// BIFROST_BLOCK attributed to the list that matched the TARGET, with the
+/// answer's records attached so the query log can show the CNAME.
+#[allow(clippy::too_many_arguments)]
+fn cname_block(
+    request: &Message,
+    mode: &BlockMode,
+    answer: &Message,
+    src: SocketAddr,
+    domain: &str,
+    qtype: u16,
+    target: &str,
+    list_id: String,
+    event_tx: &mpsc::Sender<WriterMessage>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let response = build_blocked_response(request, mode)?;
+    let client_rcode = response.metadata.response_code;
+    let bytes = response.to_bytes()?;
+    if let Err(e) = event_tx.try_send(WriterMessage::Event(QueryEvent::new(
+        src.ip().to_string(),
+        domain.to_string(),
+        qtype,
+        Action::BifrostBlock,
+        action_from_rcode(client_rcode),
+        Some(15),
+        Some(list_id.clone()),
+        None,
+        Some(extract_response_records(answer)),
+    ))) {
+        warn!(%e, "failed to send query event");
+    }
+    debug!(client=%src.ip(), %domain, qtype, %target, %list_id, "blocked via CNAME");
+    Ok(bytes)
 }
 
 fn build_blocked_response(
@@ -1259,6 +1371,170 @@ mod tests {
         sent.iter()
             .filter(|m| matches!(m, WriterMessage::CacheStore(_)))
             .count()
+    }
+
+    // ── CNAME cloaking ──────────────────────────────────────────
+
+    /// <query> CNAME <target>, <target> A 192.0.2.9: a tracker behind a
+    /// first-party name.
+    fn cloaked(req: &Message, target: &str) -> Message {
+        use hickory_proto::rr::rdata::{A, CNAME};
+        let mut r = Message::new(0, MessageType::Response, hickory_proto::op::OpCode::Query);
+        let t = Name::from_ascii(target).unwrap();
+        r.add_answer(Record::from_rdata(
+            req.queries[0].name().clone(),
+            300,
+            RData::CNAME(CNAME(t.clone())),
+        ));
+        r.add_answer(Record::from_rdata(t, 300, RData::A(A::new(192, 0, 2, 9))));
+        r
+    }
+
+    fn cloaked_to_tracker(req: &Message) -> Message {
+        cloaked(req, "c1.Tracker.NET.")
+    }
+
+    fn events(sent: &[WriterMessage]) -> Vec<&QueryEvent> {
+        sent.iter()
+            .filter_map(|m| match m {
+                WriterMessage::Event(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cname_chain(targets: &[&str]) -> Message {
+        let mut m = cloaked(&query("metrics.shop.com.", RecordType::A), targets[0]);
+        for t in &targets[1..] {
+            m.add_answer(Record::from_rdata(
+                Name::from_ascii(targets[0]).unwrap(),
+                300,
+                RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                    Name::from_ascii(t).unwrap(),
+                )),
+            ));
+        }
+        m
+    }
+
+    #[test]
+    fn blocked_cname_finds_any_target_in_the_chain() {
+        let mut bl = crate::blocklist::Blocklist::new();
+        bl.load("trackers", vec!["tracker.net".into()]);
+        let al = crate::allowlist::Allowlist::new();
+        assert_eq!(
+            blocked_cname(
+                &cname_chain(&["edge.cdn.example.", "c1.Tracker.NET."]),
+                &bl,
+                &al
+            ),
+            Some(("c1.tracker.net".into(), "trackers".into()))
+        );
+        assert_eq!(
+            blocked_cname(&cname_chain(&["edge.cdn.example."]), &bl, &al),
+            None
+        );
+        assert_eq!(
+            blocked_cname(&query("metrics.shop.com.", RecordType::A), &bl, &al),
+            None
+        );
+    }
+
+    #[test]
+    fn blocked_cname_honours_the_allowlist_and_list_exceptions() {
+        let mut bl = crate::blocklist::Blocklist::new();
+        bl.load(
+            "trackers",
+            vec!["tracker.net".into(), "@@safe.tracker.net".into()],
+        );
+        let mut al = crate::allowlist::Allowlist::new();
+        al.load(vec!["c2.tracker.net".into()]);
+        for t in ["a.safe.tracker.net.", "c2.tracker.net."] {
+            assert_eq!(blocked_cname(&cname_chain(&[t]), &bl, &al), None, "{t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cname_into_a_blocklist_is_blocked_and_never_cached() {
+        let st = state_with_upstream(cloaked_to_tracker).await;
+        st.write()
+            .await
+            .blocklist
+            .load("trackers", vec!["tracker.net".into()]);
+        let (resp, sent) = run_collecting(&st, &query("metrics.shop.com.", RecordType::A)).await;
+        assert!(is_zero_ip_block(&resp), "cloaked answer reached the client");
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(cache_stores(&sent), 0, "cloaked answer was propagated");
+        let ev = events(&sent);
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(ev[0].action, Action::BifrostBlock));
+        assert_eq!(ev[0].domain, "metrics.shop.com");
+        assert_eq!(ev[0].ede_code, Some(15));
+        assert_eq!(ev[0].list_id.as_deref(), Some("trackers"));
+        assert!(ev[0].latency_us.is_none());
+        // The CNAME stays on the event so the query log shows WHY.
+        assert!(ev[0]
+            .response_records
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|x| x.value.contains("racker"))));
+        assert!(st.read().await.cache.lookup("metrics.shop.com:1").is_none());
+    }
+
+    #[tokio::test]
+    async fn allowlisted_query_name_keeps_its_cloaked_answer() {
+        let st = state_with_upstream(cloaked_to_tracker).await;
+        {
+            let mut s = st.write().await;
+            s.blocklist.load("trackers", vec!["tracker.net".into()]);
+            s.allowlist.load(vec!["metrics.shop.com".into()]);
+        }
+        let resp = run_handler(&st, &query("metrics.shop.com.", RecordType::A)).await;
+        assert!(!is_zero_ip_block(&resp));
+        assert_eq!(resp.answers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn paused_protection_does_not_cname_block() {
+        let st = state_with_upstream(cloaked_to_tracker).await;
+        st.write()
+            .await
+            .blocklist
+            .load("trackers", vec!["tracker.net".into()]);
+        let (tx, _rx) = mpsc::channel(16);
+        let bytes = handle_query(
+            "192.168.1.42:5000".parse().unwrap(),
+            &query("metrics.shop.com.", RecordType::A)
+                .to_bytes()
+                .unwrap(),
+            &st,
+            &tx,
+            &BlockMode::ZeroIp,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(Message::from_bytes(&bytes).unwrap().answers.len(), 2);
+    }
+
+    /// An answer cached before its target was listed (or propagated from a
+    /// peer) must not bypass the check: cache hits are checked too.
+    #[tokio::test]
+    async fn cached_cloaked_answer_is_blocked_on_hit() {
+        let st = test_state();
+        {
+            let mut s = st.write().await;
+            s.ready = true;
+            let cached = cloaked_to_tracker(&query("metrics.shop.com.", RecordType::A));
+            s.cache
+                .insert("metrics.shop.com:1".into(), cached.to_bytes().unwrap(), 300);
+            s.blocklist.load("trackers", vec!["tracker.net".into()]);
+        }
+        let (resp, sent) = run_collecting(&st, &query("metrics.shop.com.", RecordType::A)).await;
+        assert!(is_zero_ip_block(&resp));
+        let ev = events(&sent);
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(ev[0].action, Action::BifrostBlock));
+        assert_eq!(ev[0].list_id.as_deref(), Some("trackers"));
     }
 
     #[tokio::test]

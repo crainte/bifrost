@@ -93,8 +93,18 @@ cname_to_blocked_alone_qualifies_test() ->
     Ctx = bifrost_threat_context:combine(#{clients => 2, widespread_threshold => 5,
                                            blocked_cnames => [<<"t.tracker.net">>]}),
     C = bifrost_api_handler:score_candidate(<<"metrics.example.com">>, 10, Ctx),
-    ?assertMatch(#{score := 3, reasons := [<<"cname_to_blocked:t.tracker.net">>]}, C),
+    ?assertMatch(#{score := 6, reasons := [<<"cname_to_blocked:t.tracker.net">>]}, C),
     ?assert(bifrost_api_handler:qualifies(C)),
+    %% Popularity and registration age cannot outweigh it.
+    Wide = bifrost_threat_context:combine(#{clients => 40, widespread_threshold => 5,
+                                            blocked_cnames => [<<"t.tracker.net">>]}),
+    Old = bifrost_api_handler:score_candidate(<<"metrics.example.com">>, 10, Wide),
+    Discounted = Old#{score => maps:get(score, Old) + bifrost_api_handler:score_rdap(#{age_days => 5000}),
+                      reasons => maps:get(reasons, Old) ++ [<<"rdap:established">>]},
+    ?assertEqual(1, maps:get(score, Discounted)),
+    ?assert(bifrost_api_handler:qualifies(Discounted)),
+    %% Still never for special-use names.
+    ?assertNot(bifrost_api_handler:qualifies(Discounted#{domain => <<"x.internal">>})),
     %% Several blocked targets are still ONE double-weight signal.
     ?assertEqual(2, bifrost_api_handler:signal_weight(
                       [<<"cname_to_blocked:a.net">>, <<"cname_to_blocked:b.net">>])).

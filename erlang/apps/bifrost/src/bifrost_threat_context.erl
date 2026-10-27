@@ -4,7 +4,8 @@
 %% carry. Lexical scoring (bifrost_api_handler:score_domain/1) cannot tell
 %% 3.pool.ntp.org from 3.ads-cdn.example; how the network uses the name can.
 %%
-%%   cname_to_blocked:<target>  +3, counts as TWO signals. The domain's answers
+%%   cname_to_blocked:<target>  +6, and qualifies on its own regardless of
+%%                              negative terms (qualifies/1). The domain's answers
 %%                              (query_log.response_records) CNAME into a name
 %%                              an enabled blocklist or manual block covers:
 %%                              CNAME cloaking, a tracker behind a first-party
@@ -35,7 +36,7 @@
 -export([suffixes/1, parent/1, widespread_threshold/1, history_sufficient/1,
          match_list/2, combine/1]).
 
--define(CNAME_SCORE, 3).
+-define(CNAME_SCORE, 6).
 -define(SIBLING_SCORE, 2).
 -define(NEW_SCORE, 1).
 -define(WIDESPREAD_SCORE, -2).

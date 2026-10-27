@@ -97,7 +97,7 @@ cname_into_an_enabled_blocklist_is_flagged(Config) ->
     Ctx = bifrost_threat_context:signals([list_to_binary(D) || {D, _} <- Cases], ?H),
     Reasons = fun(D) -> maps:get(reasons, maps:get(D, Ctx)) end,
     ?assert(lists:member(<<"cname_to_blocked:c1.tracker.net">>, Reasons(<<"metrics.shop.com">>))),
-    ?assertEqual(3, maps:get(score, maps:get(<<"metrics.shop.com">>, Ctx))),
+    ?assertEqual(6, maps:get(score, maps:get(<<"metrics.shop.com">>, Ctx))),
     ?assert(lists:member(<<"cname_to_blocked:m.manualblocked.org">>, Reasons(<<"manual.shop.com">>))),
     [?assertEqual([], [R || <<"cname_to_blocked:", _/binary>> = R <- Reasons(D)], D)
      || D <- [<<"safe.shop.com">>, <<"allowed.shop.com">>, <<"off.shop.com">>,
