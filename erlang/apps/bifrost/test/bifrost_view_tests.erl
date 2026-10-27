@@ -98,6 +98,15 @@ query_rows_show_client_name_and_block_source_test() ->
     ?assertNotEqual(nomatch, binary:match(Html, <<"datetime=\"2026-10-02T12:00:00Z\"">>)),
     ?assertEqual(nomatch, binary:match(Html, <<"text-slate-">>)).
 
+threat_suppressions_have_section_heading_test() ->
+    PrivDir = code:priv_dir(bifrost),
+    {ok, Html} = file:read_file(filename:join([PrivDir, "templates", "threats.html"])),
+    ?assertNotEqual(nomatch, binary:match(Html,
+        <<"<section id=\"sec-suppressions\" class=\"st-section\" aria-labelledby=\"suppressions-title\"">>)),
+    ?assertNotEqual(nomatch, binary:match(Html,
+        <<"<header class=\"st-section__head\"><h2 id=\"suppressions-title\">Active suppressions</h2></header>">>)),
+    ?assertNotEqual(nomatch, binary:match(Html, <<"<tbody id=\"s-rows\"">>)).
+
 rendered_html_is_valid_utf8_test() ->
     Html = bifrost_view:render_query_log_table(
         [(entry())#{list_id => null, latency_us => 12}], 1, 1, <<"time">>, <<"desc">>),
