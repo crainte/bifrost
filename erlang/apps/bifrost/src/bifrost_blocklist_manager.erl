@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, on_client_connected/0, refresh_lists/0, force_refresh/0, parse_line/1,
-         parse_blocklist/1, is_hydrated/0]).
+         parse_blocklist/1, is_hydrated/0, enabled_list_ids/0]).
 %% Exported for the cluster test suite, which drives the real fetch path across
 %% real nodes and must build the same lock id the production path uses.
 -export([fetch_lock_id/1, fetch_lock_nodes/0, try_fetch/3]).
@@ -375,6 +375,13 @@ is_stale(Name) ->
         not_found ->
             true
     end.
+
+%% Names (Mnesia blocklist_cache keys) of the lists Rust is filtering with, so
+%% control-plane analysis (bifrost_threat_context) matches against exactly the
+%% enabled set and never against a cached-but-disabled list.
+enabled_list_ids() ->
+    [proplists:get_value(name, E, "unknown")
+     || E <- get_blocklist_entries(get_config()), proplists:get_value(enabled, E, true)].
 
 get_blocklist_entries(Config) ->
     %% Get lists from config file

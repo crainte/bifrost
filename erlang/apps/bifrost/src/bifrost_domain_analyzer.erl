@@ -3,7 +3,8 @@
 
 %% Periodically scans recently-forwarded domains for algorithmically-generated
 %% / throwaway ad domains (high entropy, numbered subdomains, young registration,
-%% burst hits) and records high scorers as pending candidates for the Threats
+%% CNAME cloaking, blocked siblings) and records the ones that qualify
+%% (bifrost_api_handler:qualifies/1) as pending candidates for the Threats
 %% page. Read-only w.r.t. DNS resolution — control-plane analysis only.
 %%
 %% Cluster-wide this is a SINGLETON: the scan reads the shared query_log and
@@ -25,13 +26,12 @@
 -export([start_link/0, scan_now/0, status/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 %% spawn_monitor/3 target; the domain_analyzer_scan env can replace it (tests).
--export([run_scan/0, find_candidates/0, rank_candidates/1]).
+-export([run_scan/0, find_candidates/0, rank_candidates/1, rescore_pending/0]).
 
 -define(SCAN_INTERVAL, 15 * 60 * 1000).  %% 15 minutes
 -define(FIRST_SCAN_DELAY, 60 * 1000).    %% 1 min after boot (let traffic accrue)
 -define(WINDOW_HOURS, 24).
--define(SCORE_THRESHOLD, 3).             %% require ~2+ signals
--define(RDAP_TOP, 15).                   %% enrich only the N highest scorers
+-define(RDAP_TOP, 15).                   %% inline RDAP + live probe for the N best
 -define(LEADER, bifrost_domain_analyzer_leader).  %% cluster-wide singleton name
 
 -record(state, {scan :: undefined | {pid(), reference()},
@@ -110,14 +110,13 @@ maybe_start_scan(State = #state{scans_started = N}) ->
 
 run_scan() ->
     try
-        Candidates = find_candidates(),
-        logger:info("domain_analyzer: ~p candidates over threshold", [length(Candidates)]),
-        %% Enrich the top N with RDAP age, then persist all.
-        {Top, Rest} = lists:split(min(?RDAP_TOP, length(Candidates)), Candidates),
-        Enriched = [enrich(C) || C <- Top] ++ Rest,
-        lists:foreach(fun upsert_candidate/1, Enriched),
-        %% Auto-block only the ENRICHED set (they have the RDAP age gate).
-        maybe_auto_block(Enriched)
+        rescore_pending(),
+        Candidates = score(candidate_rows(), ?RDAP_TOP),
+        logger:info("domain_analyzer: ~p candidates qualify", [length(Candidates)]),
+        lists:foreach(fun upsert_candidate/1, Candidates),
+        %% Only candidates with a KNOWN age can pass the gate (see below), so
+        %% the whole set is safe to offer it.
+        maybe_auto_block(Candidates)
     catch
         Class:Reason:Stack ->
             logger:error("domain_analyzer scan failed: ~p:~p~n~p", [Class, Reason, Stack])
@@ -168,6 +167,9 @@ setting_int(Key, Default) ->
 %% that aren't already blocked or dismissed, or covered by an active campaign
 %% suppression (bifrost_threat_campaigns).
 find_candidates() ->
+    rank_candidates(candidate_rows()).
+
+candidate_rows() ->
     Sql = "SELECT q.domain, COUNT(*) AS hits "
           "FROM query_log q "
           "WHERE q.queried_at > now() - ($1 || ' hours')::interval "
@@ -176,28 +178,102 @@ find_candidates() ->
           "  AND NOT " ++ bifrost_threat_campaigns:suppressed_sql("q.domain", "q.client_ip") ++ " "
           "GROUP BY q.domain ORDER BY hits DESC LIMIT 2000",
     case bifrost_db_pool:equery(Sql, [integer_to_list(?WINDOW_HOURS)]) of
-        {ok, _, Rows} ->
-            rank_candidates(Rows);
-        _ ->
-            []
+        {ok, _, Rows} -> Rows;
+        _ -> []
     end.
 
+%% Rows :: [{Domain, Hits}] -> the candidates that qualify, best first, every
+%% one scored on lexical + contextual + cached RDAP signals. Never contacts a
+%% registry or the candidate itself; see score/2.
 rank_candidates(Rows) ->
-    Scored = lists:filtermap(fun({Domain, Hits}) ->
-        Score = bifrost_api_handler:score_domain(Domain, Hits),
-        case bifrost_api_handler:threat_eligible_domain(Domain)
-             andalso Score >= ?SCORE_THRESHOLD of
-            true ->
-                {true, #{domain => Domain, score => Score, hits => Hits,
-                         reasons => bifrost_api_handler:score_reasons(Domain, Hits)}};
-            false -> false
-        end
-    end, Rows),
-    lists:sort(fun(A, B) -> maps:get(score, A) >= maps:get(score, B) end, Scored).
+    score(Rows, 0).
 
-%% Enrich a candidate with out-of-band signals: RDAP registry data and a header
-%% probe (CORS/CSP). Both cached — a client already fetched this domain, so a HEAD
-%% from us leaks nothing new.
+%% The pipeline, shared by the scan, the pending re-score and the tests:
+%%  1. eligible names only, scored lexically plus bifrost_threat_context
+%%     (computed for EVERY eligible domain: a CNAME-cloaked tracker such as
+%%     metrics.example.com has no lexical signal at all);
+%%  2. RDAP for every domain with at least one positive signal. The top SyncN
+%%     look the registry up inline (claimed, paced); the rest read the cache
+%%     and queue misses for the background fill, so an established domain
+%%     drops out on the next scan without any extra inline registry traffic.
+%%     RDAP refines a candidate; a name with no signal of its own is not
+%%     looked up;
+%%  3. qualifies/1, the one rule;
+%%  4. header-probe tags (informational, no score): live for the SyncN, from
+%%     probe_cache for the rest.
+score(Rows, SyncN) ->
+    Eligible = [{D, H} || {D, H} <- Rows, bifrost_api_handler:threat_eligible_domain(D)],
+    Ctx = bifrost_threat_context:signals([D || {D, _} <- Eligible], ?WINDOW_HOURS),
+    Pre = [bifrost_api_handler:score_candidate(D, H, maps:get(D, Ctx, #{}))
+           || {D, H} <- Eligible],
+    Potential = by_score([C || #{reasons := R} = C <- Pre,
+                               bifrost_api_handler:signal_weight(R) >= 1]),
+    {Top, Rest} = lists:split(min(SyncN, length(Potential)), Potential),
+    Sync = maps:from_list([{D, true} || #{domain := D} <- Top]),
+    Rdap = [with_rdap(C, sync) || C <- Top] ++ [with_rdap(C, async) || C <- Rest],
+    by_score([with_probe(C, maps:is_key(D, Sync))
+              || #{domain := D} = C <- Rdap, bifrost_api_handler:qualifies(C)]).
+
+by_score(Cs) ->
+    lists:sort(fun(A, B) ->
+        {maps:get(score, A), maps:get(hits, A)} >= {maps:get(score, B), maps:get(hits, B)}
+    end, Cs).
+
+%% Re-score every pending row with the CURRENT rules: rows that no longer
+%% qualify are deleted, the rest get fresh scores and reasons. Without this a
+%% rule change only stopped NEW candidates, and rows queued under old rules
+%% (in-addr.arpa, bare ntp.org from the removed base-domain collapsing, reasons
+%% the name can no longer produce) stayed in the queue forever. Deleted, not
+%% dismissed: `dismissed` records an operator decision, and these were never
+%% reviewed. blocked/dismissed rows are never touched.
+rescore_pending() ->
+    case bifrost_db_pool:equery(
+            "SELECT domain, hits FROM suspicious_candidates WHERE status = 'pending'", []) of
+        {ok, _, []} ->
+            ok;
+        {ok, _, Rows} ->
+            Keep = rank_candidates(Rows),
+            KeepSet = maps:from_list([{D, true} || #{domain := D} <- Keep]),
+            Drop = [D || {D, _} <- Rows, not maps:is_key(D, KeepSet)],
+            case Drop of
+                [] -> ok;
+                _ ->
+                    case bifrost_db_pool:equery(
+                            "DELETE FROM suspicious_candidates "
+                            "WHERE status = 'pending' AND domain = ANY($1::text[])", [Drop]) of
+                        {ok, N} ->
+                            logger:info("domain_analyzer: removed ~p pending candidates "
+                                        "that no longer qualify", [N]);
+                        DelErr ->
+                            logger:warning("domain_analyzer: pending purge failed: ~p", [DelErr])
+                    end
+            end,
+            lists:foreach(fun rewrite_pending/1, Keep);
+        Err ->
+            logger:warning("domain_analyzer: pending re-score skipped: ~p", [Err])
+    end.
+
+with_rdap(#{domain := Domain, score := Score, reasons := Reasons} = C, Mode) ->
+    Rdap = bifrost_api_handler:rdap_cached(Domain, Mode),
+    C#{age_days => maps:get(age_days, Rdap, undefined),
+       rdap_lookup => maps:get(lookup, Rdap, unavailable),
+       score => Score + bifrost_api_handler:score_rdap(Rdap),
+       reasons => Reasons ++ bifrost_api_handler:rdap_reasons(Rdap)}.
+
+with_probe(#{domain := Domain, reasons := Reasons} = C, Live) ->
+    Tags = case Live of
+        true -> header_probe(Domain);
+        false ->
+            case cached_probe(Domain) of
+                {ok, Cors, Csp} -> probe_tags(Cors, Csp);
+                miss -> []
+            end
+    end,
+    C#{reasons => lists:usort(Reasons ++ Tags)}.
+
+%% Out-of-band signals: RDAP registry data and a header probe (CORS/CSP). Both
+%% cached — a client already fetched this domain, so a HEAD from us leaks
+%% nothing new.
 %%
 %% RDAP contributes BOTH score and tags. Previously every field except the age was
 %% fetched and thrown away, so the Threats page could not rank on registry data
@@ -213,30 +289,19 @@ rank_candidates(Rows) ->
 %% `sync`: this runs on the scan worker, never a request process, so a due
 %% lookup is fetched inline — claimed and paced by bifrost_rdap, so the top
 %% ?RDAP_TOP domains go out at most one per second per registry.
-enrich(#{domain := Domain} = C) ->
-    Rdap = bifrost_api_handler:rdap_cached(Domain, sync),
-    {ProbeScore, ProbeReasons} = header_probe(Domain),
-    C#{
-        age_days => maps:get(age_days, Rdap, undefined),
-        rdap_lookup => maps:get(lookup, Rdap, unavailable),
-        score => maps:get(score, C)
-                 + ProbeScore
-                 + bifrost_api_handler:score_rdap(Rdap),
-        reasons => lists:usort(maps:get(reasons, C)
-                               ++ ProbeReasons
-                               ++ bifrost_api_handler:rdap_reasons(Rdap))
-    }.
-
-%% Out-of-band header probe: HEAD the candidate over HTTPS, score absurdly
-%% permissive CORS (Access-Control-Allow-Origin: *) and missing CSP. Cached so
-%% repeated scans don't re-probe. Signal only — never gates auto-block.
+%%
+%% Out-of-band header probe: HEAD the candidate over HTTPS, tag permissive CORS
+%% (Access-Control-Allow-Origin: *) and missing CSP. Cached so repeated scans
+%% don't re-probe. TAGS ONLY, no score: "no CSP" is true of most API and CDN
+%% hosts (ntp.org had it), the same fires-on-most-of-the-internet problem that
+%% makes rdap:privacy_protected tag-only.
 header_probe(Domain) ->
     case cached_probe(Domain) of
-        {ok, Cors, Csp} -> probe_score(Cors, Csp);
+        {ok, Cors, Csp} -> probe_tags(Cors, Csp);
         miss ->
             {Cors, Csp} = do_probe(Domain),
             cache_probe(Domain, Cors, Csp),
-            probe_score(Cors, Csp)
+            probe_tags(Cors, Csp)
     end.
 
 do_probe(Domain) ->
@@ -258,12 +323,8 @@ do_probe(Domain) ->
             {false, true}
     end.
 
-%% Permissive CORS is a weak tell; missing CSP on top nudges further. Small
-%% weights — this only supplements the lexical + RDAP signals.
-probe_score(true, false) -> {2, [<<"permissive_cors">>, <<"no_csp">>]};
-probe_score(true, true)  -> {1, [<<"permissive_cors">>]};
-probe_score(false, false) -> {1, [<<"no_csp">>]};
-probe_score(false, true) -> {0, []}.
+probe_tags(Cors, Csp) ->
+    [<<"permissive_cors">> || Cors =:= true] ++ [<<"no_csp">> || Csp =:= false].
 
 cached_probe(Domain) ->
     case bifrost_db_pool:equery(
@@ -280,6 +341,20 @@ cache_probe(Domain, Cors, Csp) ->
 
 %% Upsert as pending. Never resurrects a blocked/dismissed row (the WHERE in
 %% find_candidates already excludes them, and ON CONFLICT only bumps a pending).
+%% Re-score of an existing pending row: score, reasons and RDAP state only.
+%% hits and updated_at describe the scan that last SAW the domain, so they are
+%% left alone.
+rewrite_pending(#{domain := Domain, score := Score, reasons := Reasons} = C) ->
+    bifrost_db_pool:equery(
+        "UPDATE suspicious_candidates SET score = $2, reasons = $3::jsonb, "
+        "  age_days = COALESCE($4, age_days), "
+        "  rdap_lookup = CASE WHEN $5 = 'unavailable' AND rdap_lookup = 'done' "
+        "    THEN 'done' ELSE $5 END "
+        "WHERE domain = $1 AND status = 'pending'",
+        [Domain, Score, jsx:encode(Reasons), maps:get(age_days, C, undefined),
+         atom_to_binary(maps:get(rdap_lookup, C, unavailable))]),
+    ok.
+
 upsert_candidate(#{domain := Domain, score := Score, hits := Hits, reasons := Reasons} = C) ->
     Age = maps:get(age_days, C, undefined),
     Lookup = atom_to_binary(maps:get(rdap_lookup, C, unavailable)),

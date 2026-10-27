@@ -45,7 +45,8 @@
          failed_migration_rolls_back_and_records_nothing/1,
          migration_record_uses_bound_parameters/1,
          rdap_cache_backfill_unfreezes_age_and_retries_unknowns/1,
-         threat_rdap_lookup_backfills_known_results/1]).
+         threat_rdap_lookup_backfills_known_results/1,
+         threat_suppression_kind_keeps_existing_markers/1]).
 
 -define(RUNNERS, 4).
 
@@ -55,7 +56,8 @@ all() ->
      failed_migration_rolls_back_and_records_nothing,
       migration_record_uses_bound_parameters,
       rdap_cache_backfill_unfreezes_age_and_retries_unknowns,
-      threat_rdap_lookup_backfills_known_results].
+       threat_rdap_lookup_backfills_known_results,
+       threat_suppression_kind_keeps_existing_markers].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(epgsql),
@@ -238,6 +240,40 @@ threat_rdap_lookup_backfills_known_results(Config) ->
                  rows(C, "SELECT domain, rdap_lookup FROM suspicious_candidates ORDER BY domain")),
     ?assertMatch({error, _}, epgsql:squery(
         C, "UPDATE suspicious_candidates SET rdap_lookup = 'bogus'")),
+    ok = epgsql:close(C).
+
+%% ── 7: campaign suppression shapes (017) ───────────────────────
+%% A suppression created by the previous release must survive as a marker, and
+%% the CHECK must refuse the shapes that would make the matcher misbehave.
+threat_suppression_kind_keeps_existing_markers(Config) ->
+    C = connect(Config, new_schema(Config, "threat017")),
+    RealDir = filename:join(code:priv_dir(bifrost), "migrations"),
+    {Before, [Target]} = lists:partition(
+        fun(F) -> F < "017" end,
+        [F || F <- lists:sort(real_migration_files()), F < "018"]),
+    ?assertEqual("017_threat_suppression_kind.sql", Target),
+    Read = fun(F) -> {ok, B} = file:read_file(filename:join(RealDir, F)), {F, B} end,
+    with_migration_dir(Config, "threat017", [Read(F) || F <- Before],
+                       fun() -> ok = bifrost_migrations:run(C) end),
+    sq(C, "INSERT INTO threat_suppressions (tld, leading_label, expires_at) "
+          "VALUES ('site', '447', now() + interval '1 day')"),
+    with_migration_dir(Config, "threat017", [Read(Target)],
+                       fun() -> ok = bifrost_migrations:run(C) end),
+    ?assertEqual([{<<"marker">>, <<"site">>, <<"447">>, null}],
+                 rows(C, "SELECT kind, tld, leading_label, parent FROM threat_suppressions")),
+    sq(C, "INSERT INTO threat_suppressions (kind, tld, parent, expires_at) "
+          "VALUES ('family', 'com', 'stg.content-loader.com', now() + interval '1 day')"),
+    [?assertMatch({error, _}, epgsql:squery(C, Bad))
+     || Bad <- ["INSERT INTO threat_suppressions (kind, tld, leading_label, parent, expires_at) "
+                "VALUES ('family', 'com', '1', 'a.com', now() + interval '1 day')",
+                "INSERT INTO threat_suppressions (kind, tld, parent, expires_at) "
+                "VALUES ('family', 'net', 'a.com', now() + interval '1 day')",
+                "INSERT INTO threat_suppressions (kind, tld, parent, expires_at) "
+                "VALUES ('family', 'com', 'com', now() + interval '1 day')",
+                "INSERT INTO threat_suppressions (tld, expires_at) "
+                "VALUES ('site', now() + interval '1 day')",
+                "INSERT INTO threat_suppressions (kind, tld, leading_label, expires_at) "
+                "VALUES ('bogus', 'site', '447', now() + interval '1 day')"]],
     ok = epgsql:close(C).
 
 %% ── helpers ───────────────────────────────────────────────────

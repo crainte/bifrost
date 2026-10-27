@@ -1,11 +1,16 @@
 -module(bifrost_api_handler).
 
 -export([init/2, push_rewrites/0, push_allowlist/0, push_manual_blocks/0, push_client_blocks/0]).
--export([score_domain/2, score_reasons/2, threat_eligible_domain/1,
+-export([score_domain/1, score_reasons/1, score_candidate/3, qualifies/1,
+         signal_weight/1, threat_eligible_domain/1,
          rdap_lookup/1, rdap_cached/1, rdap_cached/2, rdap_registry/1,
          rdap_reasons/1, score_rdap/1, enrich_with_rdap/1, extract_base_domain/1]).
 
 -define(JSON, #{<<"content-type">> => <<"application/json">>}).
+%% A candidate needs this total score AND two independent signals; see qualifies/1.
+-define(SCORE_THRESHOLD, 3).
+%% Registrations at least this old score -3 (rdap:established); see score_rdap/1.
+-define(ESTABLISHED_DAYS, 730).
 %% One window for every "recent activity" figure (dashboard, query log default,
 %% clients), so the pages never disagree about the same traffic.
 -define(STATS_WINDOW, "90 days").
@@ -1063,11 +1068,14 @@ get_threats() ->
         "  to_char(first_seen, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') "
         "FROM suspicious_candidates WHERE status = 'pending' "
         "ORDER BY score DESC, hits DESC LIMIT 200") of
+        %% Eligibility is re-checked here, not only when a candidate is created:
+        %% rows queued under older rules (in-addr.arpa, *.internal) otherwise sit
+        %% in the queue until the next scan's re-score deletes them.
         {ok, _, Rows} when is_list(Rows) ->
             [#{domain => D, score => S,
                reasons => parse_reasons(R),
                hits => H, age_days => Age, rdap_lookup => Lookup, first_seen => FS}
-             || {D, S, R, H, Age, Lookup, FS} <- Rows];
+             || {D, S, R, H, Age, Lookup, FS} <- Rows, threat_eligible_domain(D)];
         _ ->
             []
     end.
@@ -1201,14 +1209,13 @@ find_suspicious_domains(ClientIpTuple, Hours, Limit) when is_tuple(ClientIpTuple
            LIMIT 500",
     case db_call(equery, Sql, [ClientIpTuple, integer_to_list(Hours)]) of
         {ok, _, Rows} ->
-            Scored = lists:filtermap(fun({Domain, Hits}) ->
-                Score = score_domain(Domain, Hits),
-                case threat_eligible_domain(Domain) andalso Score > 0 of
-                    true -> {true, #{domain => Domain, score => Score, hits => Hits,
-                                     reasons => score_reasons(Domain, Hits)}};
-                    false -> false
-                end
-            end, Rows),
+            %% Same rule as the analyzer: lexical + contextual signals, then
+            %% qualifies/1. RDAP is layered on afterwards by enrich_with_rdap/1.
+            Eligible = [{D, H} || {D, H} <- Rows, threat_eligible_domain(D)],
+            Ctx = bifrost_threat_context:signals([D || {D, _} <- Eligible], Hours),
+            Scored = lists:filter(fun qualifies/1,
+                                  [score_candidate(D, H, maps:get(D, Ctx, #{}))
+                                   || {D, H} <- Eligible]),
             Sorted = lists:sort(fun(A, B) ->
                 maps:get(score, A) >= maps:get(score, B)
             end, Scored),
@@ -1231,10 +1238,51 @@ threat_eligible_domain(Domain) when is_binary(Domain) ->
 threat_eligible_domain(_) ->
     false.
 
-score_domain(Domain, Hits) ->
+%% One candidate from its lexical signals plus the contextual ones computed by
+%% bifrost_threat_context:signals/2 (an empty map = no context).
+score_candidate(Domain, Hits, Ctx) ->
+    #{domain => Domain, hits => Hits,
+      score => score_domain(Domain) + maps:get(score, Ctx, 0),
+      reasons => score_reasons(Domain) ++ maps:get(reasons, Ctx, [])}.
+
+%% THE qualification rule, shared by the analyzer scan, the pending re-score and
+%% the per-client scan. A score over threshold is not enough on its own: a
+%% leading number is worth 3, and every sharded service (N.pool.ntp.org,
+%% 0.gravatar.com) has one. So it also takes two INDEPENDENT positive signals.
+%% Negative terms (rdap:established, widespread) lower the score but never count
+%% as signals, and tags (no_csp, single_client, ...) count for nothing.
+-spec qualifies(map()) -> boolean().
+qualifies(#{domain := Domain, score := Score, reasons := Reasons}) ->
+    threat_eligible_domain(Domain)
+        andalso Score >= ?SCORE_THRESHOLD
+        andalso signal_weight(Reasons) >= 2;
+qualifies(_) ->
+    false.
+
+-spec signal_weight([binary()]) -> non_neg_integer().
+signal_weight(Reasons) ->
+    lists:sum([W || {_, W} <- lists:usort([signal(R) || R <- Reasons])]).
+
+%% cname_to_blocked counts as two: the blocklists have already vouched for the
+%% target, which is stronger evidence than any lexical guess. One weight however
+%% many blocked targets the tags name.
+signal(<<"cname_to_blocked:", _/binary>>) -> {cname_to_blocked, 2};
+signal(R) ->
+    case lists:member(R, [<<"numbered_subdomain">>, <<"hyphenated_generic">>,
+                          <<"suspicious_tld">>, <<"random_name">>, <<"high_entropy">>,
+                          <<"deep_subdomains">>, <<"long_domain">>,
+                          <<"blocked_sibling">>, <<"newly_seen">>,
+                          <<"rdap:new_domain">>, <<"rdap:pending_delete">>]) of
+        true -> {R, 1};
+        false -> {R, 0}
+    end.
+
+%% Lexical score. Hit volume is deliberately NOT a term: nearly every domain
+%% clears a few hits a day, so "burst_hits" fired on everything and was a
+%% constant offset. hits stays on the candidate for display and sorting only.
+score_domain(Domain) ->
     score_numbered_subdomain(Domain) +
     score_hyphenated_generic(Domain) +
-    score_burst_hits(Hits) +
     score_suspicious_tld(Domain) +
     score_short_random(Domain) +
     score_entropy(Domain) +
@@ -1252,19 +1300,16 @@ score_numbered_subdomain(Domain) ->
             end
     end.
 
-%% Generic hyphenated names: content-loader, error-report, html-load
+%% Generic hyphenated names: content-loader, error-report, html-load. Worth 1:
+%% the substrings also hit plenty of legitimate hosts, so it is one of the two
+%% signals, never most of the threshold on its own.
 score_hyphenated_generic(Domain) ->
     Generics = [<<"content-">>, <<"error-">>, <<"-load">>, <<"-loader">>,
                 <<"-report">>, <<"-track">>, <<"-sync">>, <<"-cdn">>],
     case lists:any(fun(P) -> binary:match(Domain, P) =/= nomatch end, Generics) of
-        true -> 2;
+        true -> 1;
         false -> 0
     end.
-
-%% Burst of hits in short window suggests ad SDK
-score_burst_hits(Hits) when Hits >= 10 -> 2;
-score_burst_hits(Hits) when Hits >= 5 -> 1;
-score_burst_hits(_) -> 0.
 
 %% Suspicious TLDs commonly used for throwaway ad domains
 score_suspicious_tld(Domain) ->
@@ -1318,14 +1363,17 @@ shannon_entropy(Bin) ->
         Acc - P * math:log2(P)
     end, 0.0, Freqs).
 
-%% Deep subdomain nesting: a.b.c.d.example.com
+%% Deep subdomain nesting: a.b.c.d.example.com. Not scored when the name is
+%% numbered: 0.pool.ntp.org is deep BECAUSE of the shard label, so counting
+%% depth too would score one fact twice.
 score_subdomain_depth(Domain) ->
     Parts = binary:split(Domain, <<".">>, [global]),
     Depth = length(Parts),
-    if
-        Depth >= 5 -> 2;
-        Depth >= 4 -> 1;
-        true -> 0
+    case score_numbered_subdomain(Domain) > 0 of
+        true -> 0;
+        false when Depth >= 5 -> 2;
+        false when Depth >= 4 -> 1;
+        false -> 0
     end.
 
 %% Very long domain names
@@ -1337,15 +1385,12 @@ score_long_domain(Domain) ->
         true -> 0
     end.
 
-score_reasons(Domain, Hits) ->
+score_reasons(Domain) ->
     R1 = case score_numbered_subdomain(Domain) > 0 of
         true -> [<<"numbered_subdomain">>]; false -> []
     end,
     R2 = case score_hyphenated_generic(Domain) > 0 of
         true -> [<<"hyphenated_generic">>]; false -> []
-    end,
-    R3 = case score_burst_hits(Hits) > 0 of
-        true -> [<<"burst_hits">>]; false -> []
     end,
     R4 = case score_suspicious_tld(Domain) > 0 of
         true -> [<<"suspicious_tld">>]; false -> []
@@ -1362,7 +1407,7 @@ score_reasons(Domain, Hits) ->
     R8 = case score_long_domain(Domain) > 0 of
         true -> [<<"long_domain">>]; false -> []
     end,
-    R1 ++ R2 ++ R3 ++ R4 ++ R5 ++ R6 ++ R7 ++ R8.
+    R1 ++ R2 ++ R4 ++ R5 ++ R6 ++ R7 ++ R8.
 
 
 %% ── RDAP enrichment ──────────────────────────────────────────
@@ -1585,7 +1630,14 @@ is_redacted_vcard(_) -> false.
 %%
 %%   age_days          SCORES. The strongest signal there is for throwaway ad
 %%                     infrastructure, and graduated so "3 weeks old" and "3 years
-%%                     old" are not the same claim.
+%%                     old" are not the same claim. It also scores NEGATIVELY: a
+%%                     registration two or more years old (`rdap:established`)
+%%                     is -3. Sharded infrastructure (N.pool.ntp.org, 0.gravatar.com)
+%%                     looks exactly like a numbered throwaway lexically, and its
+%%                     age is the fact that tells them apart. The auto-block gate
+%%                     requires age < max_age (default 30d), so the -3 never
+%%                     applies to anything it can fire on. Negative terms never
+%%                     count towards the two-signal rule (qualifies/1).
 %%   pending_delete    SCORES. Rare, and unambiguous: the registration is being
 %%                     abandoned while the domain is still serving your clients.
 %%   privacy_protected TAG ONLY. Registrant redaction is near-universal
@@ -1604,6 +1656,7 @@ score_rdap(RdapData) ->
         D when is_integer(D), D < 30 -> 3;
         D when is_integer(D), D < 180 -> 2;
         D when is_integer(D), D < 365 -> 1;
+        D when is_integer(D), D >= ?ESTABLISHED_DAYS -> -3;
         _ -> 0
     end,
     DeleteScore = case maps:get(pending_delete, RdapData, undefined) of
@@ -1634,7 +1687,11 @@ rdap_reasons(RdapData) ->
         true -> [<<"rdap:privacy_protected">>];
         _ -> []
     end,
-    R1 ++ R2 ++ R3 ++ R4.
+    R5 = case maps:get(age_days, RdapData, undefined) of
+        D2 when is_integer(D2), D2 >= ?ESTABLISHED_DAYS -> [<<"rdap:established">>];
+        _ -> []
+    end,
+    R1 ++ R2 ++ R3 ++ R4 ++ R5.
 
 %% ── Postgres helpers ─────────────────────────────────────────
 
