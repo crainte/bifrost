@@ -91,7 +91,7 @@
         <div class="st-row__label"><h3>Signal sources</h3><p>Shown as tags on each candidate.</p></div>
         <div class="st-row__control"><dl class="st-switches">
           <div class="st-tile"><dt><span class="tag">Bifrost signal</span></dt><dd>Bifrost's own analysis of the name: random-looking labels, numbered subdomains, generic hyphenated words, unusual TLDs, depth and length.</dd></div>
-          <div class="st-tile"><dt><span class="tag">cname to blocked</span></dt><dd>The hostname's answers alias (CNAME) to a name your blocklists or manual blocks cover: a tracker hidden behind a first-party name. Counts as two signals.</dd></div>
+          <div class="st-tile"><dt><span class="tag tag-danger">cname to blocked</span></dt><dd>The hostname's answers alias (CNAME) to a name your blocklists or manual blocks cover: a tracker hidden behind a first-party name. Bifrost blocks these when it resolves them, so a queued one was answered before the block applied or its name is allowlisted. Always queued, whatever else it scores.</dd></div>
           <div class="st-tile"><dt><span class="tag">blocked sibling</span></dt><dd>Another hostname under the same parent is already blocked, so your Block decisions carry over to the rest of the family.</dd></div>
           <div class="st-tile"><dt><span class="tag">newly seen</span></dt><dd>First queried on your network within the last 7 days. Only applied once the query log holds 30 days of history.</dd></div>
           <div class="st-tile"><dt><span class="tag">widespread</span></dt><dd>Queried by many of your devices, which points to shared infrastructure such as NTP, OS updates or a CDN. Subtracts points.</dd></div>
@@ -127,7 +127,7 @@
   var INFO = {single_client: 1, permissive_cors: 1, no_csp: 1};
   function reasonTag(r) {
     if (r.indexOf('cname_to_blocked:') === 0) {
-      var c = make('span', 'tag', 'cname \u2192 ' + r.slice(17)); c.title = 'Aliases (CNAME) to a blocked name'; return c;
+      var c = make('span', 'tag tag-danger', 'cname \u2192 ' + r.slice(17)); c.title = 'Aliases (CNAME) to a blocked name'; return c;
     }
     var rdap = r.indexOf('rdap:') === 0, tag = make('span', rdap ? 'tag tag-rdap' : INFO[r] ? 'tag tag-info' : 'tag', (rdap ? r.slice(5) : r).replace(/_/g, ' '));
     tag.title = rdap ? 'From RDAP registry data' : INFO[r] ? 'Informational, adds no points' : '';

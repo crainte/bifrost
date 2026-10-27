@@ -140,6 +140,21 @@ settings_page_has_structured_layout_test() ->
     ?assertNotEqual(nomatch, binary:match(Css, <<".st-row{display:grid">>)),
     ?assertEqual(nomatch, binary:match(Css, <<".settings-grid">>)).
 
+%% A CNAME-cloaking block (Rust attaches the answer) names the alias chain; an
+%% ordinary block, or a forwarded answer with a CNAME, does not.
+cname_block_shows_the_alias_chain_test() ->
+    Rec = [#{<<"rtype">> => <<"CNAME">>, <<"value">> => <<"edge.cdn.example.">>},
+           #{<<"rtype">> => <<"CNAME">>, <<"value">> => <<"c1.<tracker>.net.">>},
+           #{<<"rtype">> => <<"A">>, <<"value">> => <<"192.0.2.9">>}],
+    Row = fun(E) -> bifrost_view:render_query_log_table([maps:merge(entry(), E)], 1, 1,
+                                                        <<"time">>, <<"desc">>) end,
+    Html = Row(#{response_records => Rec}),
+    ?assert(binary:match(Html, <<"via CNAME → edge.cdn.example → c1.&lt;tracker&gt;.net"/utf8>>)
+            =/= nomatch),
+    ?assertEqual(nomatch, binary:match(Row(#{}), <<"via CNAME">>)),
+    ?assertEqual(nomatch, binary:match(Row(#{action => <<"NOERROR">>, response_records => Rec}),
+                                       <<"via CNAME">>)).
+
 entry() ->
     #{id => 42, client_ip => <<"192.168.1.10">>, domain => <<"<unsafe>">>,
       qtype => 1, action => <<"BIFROST_BLOCK">>, client_rcode => <<"NXDOMAIN">>,

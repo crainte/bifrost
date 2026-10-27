@@ -100,7 +100,8 @@ format_log_row(#{client_ip := ClientIp, domain := Domain, qtype := Qtype,
         <<"<td class=\"ql-client\"><div style=\"display:flex;align-items:center;gap:6px\"><div style=\"min-width:0\">">>, Client, <<"</div>">>,
         <<"<button type=\"button\" class=\"ql-icon-btn ql-copy-btn\" data-copy=\"">>, ClientIpE,
         <<"\" aria-label=\"Copy client IP\" title=\"Copy client IP\"><svg class=\"ic ic-sm\" aria-hidden=\"true\"><use href=\"#i-copy\"/></svg></button></div></td>">>,
-        <<"<td>">>, action_badge(Action, DisplayAction), result_note(Action, ListId, LatencyUs), <<"</td>">>,
+        <<"<td>">>, action_badge(Action, DisplayAction), result_note(Action, ListId, LatencyUs),
+                  cname_note(Action, ResponseRecords), <<"</td>">>,
         <<"<td style=\"text-align:right\">">>, Menu, <<"</td></tr>">>,
         <<"<tr id=\"">>, DetailId, <<"\" class=\"ql-detail hidden\"><td colspan=\"5\"><div class=\"ql-detail-body\">">>,
         Details, <<"</div></td></tr>">>
@@ -115,6 +116,20 @@ result_note(_, _, Latency) when is_integer(Latency) -> note(latency_value(Latenc
 result_note(_, _, _) -> <<"">>.
 
 note(Text) -> [<<"<span class=\"ql-sub\">">>, Text, <<"</span>">>].
+
+%% A block that carries answer records is a CNAME-cloaking block: Rust only
+%% attaches records to a block when the upstream answer's CNAME target was the
+%% blocked name. Shows the whole alias chain, since any hop may be the one
+%% that matched (the Blocklist detail names the list).
+cname_note(<<"BIFROST_BLOCK">>, Records) when is_list(Records) ->
+    case [V || #{<<"rtype">> := <<"CNAME">>, <<"value">> := V} <- Records, is_binary(V)] of
+        [] -> <<"">>;
+        Targets ->
+            Chain = lists:join(<<" → "/utf8>>,
+                               [escape_h(string:trim(T, trailing, ".")) || T <- Targets]),
+            note([<<"via CNAME → "/utf8>> | Chain])
+    end;
+cname_note(_, _) -> <<"">>.
 
 action_badge(undefined, _Display) ->
     badge_span(<<"pill-muted">>, <<"Unknown">>);
