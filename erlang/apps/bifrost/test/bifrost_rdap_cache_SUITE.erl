@@ -190,7 +190,9 @@ enrich_path_never_contacts_the_registry(_Config) ->
         #{domain => <<"www.old-example.com">>, score => 1, hits => 1, reasons => []}
     ]),
     ?assertEqual(done, maps:get(lookup, maps:get(rdap, Old))),
-    ?assertEqual([], maps:get(reasons, Old)).
+    %% 1000 days old: established, which discounts rather than adds.
+    ?assertEqual([<<"rdap:established">>], maps:get(reasons, Old)),
+    ?assertEqual(1 - 3, maps:get(score, Old)).
 
 %% Many simultaneous page loads (and subdomain variants of the same
 %% registration) on one cold domain: exactly one registry request.
@@ -354,7 +356,8 @@ rdap_signals_are_namespaced_and_scoring_is_total(_Config) ->
     ?assertEqual(3, bifrost_api_handler:score_rdap(#{age_days => 10})),
     ?assertEqual(2, bifrost_api_handler:score_rdap(#{age_days => 100})),
     ?assertEqual(1, bifrost_api_handler:score_rdap(#{age_days => 300})),
-    ?assertEqual(0, bifrost_api_handler:score_rdap(#{age_days => 4000})),
+    ?assertEqual(0, bifrost_api_handler:score_rdap(#{age_days => 400})),
+    ?assertEqual(-3, bifrost_api_handler:score_rdap(#{age_days => 4000})),
     ?assertEqual(3, bifrost_api_handler:score_rdap(#{pending_delete => true})),
 
     ?assertEqual(0, bifrost_api_handler:score_rdap(#{privacy_protected => true})),
@@ -376,7 +379,7 @@ rdap_signals_are_namespaced_and_scoring_is_total(_Config) ->
          ?assertEqual(0, bifrost_api_handler:score_rdap(Empty))
      end || L <- [pending, unavailable]],
     ?assertEqual([], bifrost_api_handler:rdap_reasons(
-                       #{age_days => 4000, has_transfer_lock => true,
+                       #{age_days => 400, has_transfer_lock => true,
                          pending_delete => false, privacy_protected => false})).
 
 %% A caller binding the wrong type must cost that ONE request, not the pool.

@@ -9,7 +9,7 @@
 
     <section id="sec-campaigns" class="st-section" aria-labelledby="campaigns-title">
       <header class="st-section__head">
-        <div><h2 id="campaigns-title">Campaigns</h2><p>Groups of generated hostnames that share a marker label and TLD, such as <code>447.*.site</code>. Dismissing a campaign hides matching hostnames from review until it expires. It does not allow or block DNS.</p></div>
+        <div><h2 id="campaigns-title">Campaigns</h2><p>Groups of generated hostnames. A <strong>family</strong> is numbered siblings under one parent, such as <code>{n}.stg.content-loader.com</code>. A <strong>marker</strong> campaign is the same label across at least three different registered domains, such as <code>447.*.site</code>. Dismissing a campaign hides matching hostnames from review until it expires. It does not allow or block DNS.</p></div>
       </header>
       <div class="table-wrap"><table class="data-table">
         <thead><tr>
@@ -83,12 +83,18 @@
     </section>
 
     <section id="sec-signals" class="st-section" aria-labelledby="signals-title">
-      <header class="st-section__head"><div><h2 id="signals-title">How scoring works</h2><p>Each signal adds points. Higher scores indicate more evidence, not certainty.</p></div></header>
+      <header class="st-section__head"><div><h2 id="signals-title">How scoring works</h2><p>A hostname is queued only when its score reaches 3 <em>and</em> it has at least two independent signals, so a numbered name such as <code>0.pool.ntp.org</code> is not enough on its own. Higher scores indicate more evidence, not certainty.</p></div></header>
       <div class="st-row">
         <div class="st-row__label"><h3>Signal sources</h3><p>Shown as tags on each candidate.</p></div>
         <div class="st-row__control"><dl class="st-switches">
-          <div class="st-tile"><dt><span class="tag">Bifrost signal</span></dt><dd>Bifrost's own analysis of the name and traffic pattern: random-looking labels, numbered subdomains, query bursts.</dd></div>
-          <div class="st-tile"><dt><span class="tag tag-rdap">Registry signal</span></dt><dd>RDAP facts such as registration age or pending deletion. Looked up once per registrable domain and cached; lookup status is shown even when no adverse signal is found.</dd></div>
+          <div class="st-tile"><dt><span class="tag">Bifrost signal</span></dt><dd>Bifrost's own analysis of the name: random-looking labels, numbered subdomains, generic hyphenated words, unusual TLDs, depth and length.</dd></div>
+          <div class="st-tile"><dt><span class="tag">cname to blocked</span></dt><dd>The hostname's answers alias (CNAME) to a name your blocklists or manual blocks cover: a tracker hidden behind a first-party name. Counts as two signals.</dd></div>
+          <div class="st-tile"><dt><span class="tag">blocked sibling</span></dt><dd>Another hostname under the same parent is already blocked, so your Block decisions carry over to the rest of the family.</dd></div>
+          <div class="st-tile"><dt><span class="tag">newly seen</span></dt><dd>First queried on your network within the last 7 days. Only applied once the query log holds 30 days of history.</dd></div>
+          <div class="st-tile"><dt><span class="tag">widespread</span></dt><dd>Queried by many of your devices, which points to shared infrastructure such as NTP, OS updates or a CDN. Subtracts points.</dd></div>
+          <div class="st-tile"><dt><span class="tag tag-info">single client</span> <span class="tag tag-info">no csp</span></dt><dd>Informational. Single client, permissive CORS and missing CSP are shown for context but add no points: they are true of most hosts.</dd></div>
+          <div class="st-tile"><dt><span class="tag tag-rdap">Registry signal</span></dt><dd>RDAP facts such as registration age or pending deletion. A registration two or more years old (<em>established</em>) subtracts points. Looked up once per registrable domain and cached.</dd></div>
+          <div class="st-tile"><dt><span class="pill pill-good">RDAP checked</span></dt><dd>Registry data was retrieved; anything adverse appears as a registry tag. <em>RDAP queued</em> means a lookup is waiting in the background. <em>RDAP not checked</em> means the domain has no lookup yet or its TLD has no known registry.</dd></div>
         </dl></div>
       </div>
     </section>
@@ -109,6 +115,20 @@
   function toast(msg, kind) {
     var bar = $('t-status'); $('t-status-text').textContent = msg; bar.className = 'st-savebar ' + (kind || '');
     clearTimeout(toastTimer); toastTimer = setTimeout(function () { bar.classList.add('st-hidden'); }, kind === 'error' ? 7000 : 3500);
+  }
+  var RDAP = {
+    done: ['pill-good', 'RDAP checked', 'Registry data retrieved; adverse findings appear as RDAP tags'],
+    pending: ['pill-warn', 'RDAP queued', 'A registry lookup is waiting in the background; refresh after the next scan'],
+    unavailable: ['pill-muted', 'RDAP not checked', 'Not looked up yet, or the TLD has no known registry']
+  };
+  var INFO = {single_client: 1, permissive_cors: 1, no_csp: 1};
+  function reasonTag(r) {
+    if (r.indexOf('cname_to_blocked:') === 0) {
+      var c = make('span', 'tag', 'cname \u2192 ' + r.slice(17)); c.title = 'Aliases (CNAME) to a blocked name'; return c;
+    }
+    var rdap = r.indexOf('rdap:') === 0, tag = make('span', rdap ? 'tag tag-rdap' : INFO[r] ? 'tag tag-info' : 'tag', (rdap ? r.slice(5) : r).replace(/_/g, ' '));
+    tag.title = rdap ? 'From RDAP registry data' : INFO[r] ? 'Informational, adds no points' : '';
+    return tag;
   }
   function matchesPolicy(t) { return t.score >= policy.score && t.age_days != null && t.age_days < policy.age; }
   function sevClass(score) { return score >= policy.score ? 'sev sev-high' : score >= policy.score - 3 ? 'sev sev-mid' : 'sev sev-low'; }
@@ -148,16 +168,13 @@
       var c1 = make('td', 't-domain', t.domain); var rel = relative(t.first_seen); if (rel) c1.appendChild(make('small', null, rel));
       var c2 = make('td'); var sev = make('span', sevClass(t.score), t.score); sev.title = t.score >= policy.score ? 'At or above auto-block threshold' : 'Below auto-block threshold'; c2.appendChild(sev);
       var c3 = make('td'), tags = make('div', 't-tags');
-      (t.reasons || []).forEach(function (r) {
-        var rdap = r.indexOf('rdap:') === 0, tag = make('span', rdap ? 'tag tag-rdap' : 'tag', (rdap ? r.slice(5) : r).replace(/_/g, ' '));
-        if (rdap) tag.title = 'From RDAP registry data'; tags.appendChild(tag);
-      });
+      var lookup = RDAP[t.rdap_lookup] || RDAP.unavailable, pill = make('span', 'pill ' + lookup[0], lookup[1]);
+      pill.title = lookup[2]; tags.appendChild(pill);
+      (t.reasons || []).forEach(function (r) { tags.appendChild(reasonTag(r)); });
       c3.appendChild(tags);
       var c4 = make('td', null, Number(t.hits || 0).toLocaleString()); c4.style.textAlign = 'right';
       var c5 = make('td'); c5.style.textAlign = 'right';
       c5.appendChild(t.age_days == null ? make('span', 'section-kicker', 'unknown') : make('span', 'pill ' + (t.age_days < 30 ? 'pill-danger' : t.age_days < 90 ? 'pill-warn' : 'pill-muted'), t.age_days >= 730 ? Math.floor(t.age_days / 365) + 'y' : t.age_days + 'd'));
-      var lookup = t.rdap_lookup || 'unavailable', lookupText = lookup === 'done' ? 'registry looked up' : lookup === 'pending' ? 'registry pending' : 'registry unavailable';
-      c5.appendChild(make('small', 'section-kicker', lookupText));
       var c6 = make('td'), acts = make('div', 't-actions'), dismiss = make('button', 'btn btn-ghost btn-sm', 'Dismiss'), blk = make('button', 'btn btn-danger btn-sm', 'Block');
       dismiss.type = blk.type = 'button';
       dismiss.onclick = function () { act([t.domain], 'dismiss'); };
@@ -262,7 +279,7 @@
         var who = scope.value ? 'from ' + scope.value : 'from all clients';
         if (!confirm('Hide ' + c.pattern + ' ' + who + ' for ' + days.value + ' days? DNS is not changed.')) return;
         btn.disabled = true;
-        post('/api/threats/campaigns/dismiss', {tld: c.tld, leading_label: c.leading_label, client_ip: scope.value || null, days: Number(days.value)})
+        post('/api/threats/campaigns/dismiss', {kind: c.kind, tld: c.tld, leading_label: c.leading_label, parent: c.parent, client_ip: scope.value || null, days: Number(days.value)})
           .then(function (r) { toast(c.pattern + ': ' + r.dismissed + ' dismissed until ' + new Date(r.expires_at).toLocaleDateString() + '.'); refresh(); })
           .catch(function () { btn.disabled = false; toast('Could not dismiss ' + c.pattern + '.', 'error'); });
       };

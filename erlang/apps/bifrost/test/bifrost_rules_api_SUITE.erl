@@ -26,7 +26,9 @@
          client_blocks_are_listed/1,
          clients_report_last_seen/1,
          query_log_and_clients_share_the_dashboard_window/1,
-         campaign_dismissal_expires_and_is_client_scoped/1]).
+         campaign_dismissal_expires_and_is_client_scoped/1,
+         pending_threats_are_rescored_under_current_rules/1,
+         family_dismissal_covers_only_that_parents_siblings/1]).
 
 -define(PORT, 18123).
 
@@ -45,7 +47,9 @@ all() ->
      client_blocks_are_listed,
      clients_report_last_seen,
      query_log_and_clients_share_the_dashboard_window,
-     campaign_dismissal_expires_and_is_client_scoped].
+     campaign_dismissal_expires_and_is_client_scoped,
+     pending_threats_are_rescored_under_current_rules,
+     family_dismissal_covers_only_that_parents_siblings].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(crypto),
@@ -104,7 +108,7 @@ end_per_suite(Config) ->
 init_per_testcase(_TC, Config) ->
     [sql(Config, "DELETE FROM " ++ T)
      || T <- ["manual_blocks", "allowlist", "client_blocks", "rewrites", "suspicious_candidates",
-              "threat_suppressions"]],
+              "threat_suppressions", "rdap_cache"]],
     Config.
 
 %% ── cases ─────────────────────────────────────────────────────
@@ -316,6 +320,74 @@ campaign_dismissal_expires_and_is_client_scoped(Config) ->
     ?assertEqual(404, post("/api/threats/suppressions/revoke", #{id => Id})),
     ?assert(lists:member(<<"447.delta.site">>, Found())).
 
+%% Rows queued under older rules: bare names from the removed base-domain
+%% collapsing, special-use names, single-signal shards, an established
+%% registration, and stale reasons. The page hides ineligible rows at once; the
+%% re-score deletes everything that no longer qualifies, rewrites what still
+%% does, and never touches an operator decision.
+pending_threats_are_rescored_under_current_rules(Config) ->
+    sql(Config, "INSERT INTO suspicious_candidates (domain, score, hits, reasons, status) VALUES "
+                "('in-addr.arpa', 7, 6112, '[\"burst_hits\", \"deep_subdomains\"]', 'pending'), "
+                "('com.internal', 5, 3, '[]', 'pending'), "
+                "('ntp.org', 7, 28, '[\"numbered_subdomain\", \"no_csp\"]', 'pending'), "
+                "('0.gravatar.com', 3, 2, '[\"numbered_subdomain\"]', 'pending'), "
+                "('5.stg.old-loader.com', 6, 2, '[\"burst_hits\"]', 'pending'), "
+                "('4.stg.content-loader.com', 6, 2, '[\"burst_hits\", \"deep_subdomains\"]', 'pending'), "
+                "('foo.internal', 5, 2, '[]', 'dismissed'), "
+                "('0.pool.ntp.org', 5, 2, '[]', 'dismissed'), "
+                "('1.x.site', 5, 2, '[]', 'blocked')"),
+    %% old-loader.com was registered 1000 days ago: established, -3.
+    sql(Config, "INSERT INTO rdap_cache (domain, status, registered_on, has_transfer_lock, "
+                "pending_delete, privacy_protected) "
+                "VALUES ('old-loader.com', 'ok', current_date - 1000, true, false, false)"),
+
+    {200, #{<<"threats">> := Shown}} = json_request(get, "/api/threats", none),
+    ShownDomains = [maps:get(<<"domain">>, T) || T <- Shown],
+    ?assertNot(lists:member(<<"in-addr.arpa">>, ShownDomains)),
+    ?assertNot(lists:member(<<"com.internal">>, ShownDomains)),
+
+    ok = bifrost_domain_analyzer:rescore_pending(),
+    ?assertEqual([<<"4.stg.content-loader.com">>],
+                 col(Config, "SELECT domain FROM suspicious_candidates WHERE status = 'pending'")),
+    ?assertEqual([{<<"4">>, <<"[\"hyphenated_generic\", \"numbered_subdomain\"]">>, <<"2">>}],
+                 rows(Config, "SELECT score::text, reasons::text, hits::text "
+                              "FROM suspicious_candidates WHERE status = 'pending'")),
+    ?assertEqual([<<"0.pool.ntp.org">>, <<"1.x.site">>, <<"foo.internal">>],
+                 col(Config, "SELECT domain FROM suspicious_candidates WHERE status <> 'pending'")).
+
+%% A family dismissal (posted the way the page posts it) dismisses the queued
+%% siblings of THAT parent only, and hides that parent's future siblings from
+%% the analyzer. A deeper name or a non-enumerated child is not a sibling.
+family_dismissal_covers_only_that_parents_siblings(Config) ->
+    sql(Config, "CREATE TABLE IF NOT EXISTS query_log_dashboard_test PARTITION OF query_log DEFAULT"),
+    sql(Config, "DELETE FROM query_log WHERE domain LIKE '%-loader.com'"),
+    Log = fun(D) ->
+        sql(Config, "INSERT INTO query_log (client_ip, domain, qtype, action, client_rcode) "
+                    "VALUES ('10.10.10.7', '" ++ D ++ "', 1, 'NOERROR', 'NOERROR')")
+    end,
+    sql(Config, "INSERT INTO suspicious_candidates (domain, score, hits) VALUES "
+                "('0.stg.content-loader.com', 4, 2), ('1.stg.content-loader.com', 4, 2), "
+                "('2.stg.content-loader.com', 4, 2), ('3.x.stg.content-loader.com', 4, 2), "
+                "('api.stg.content-loader.com', 4, 2), ('0.stg.other-loader.com', 4, 2)"),
+    {200, #{<<"campaigns">> := [Family]}} = json_request(get, "/api/threats/campaigns", none),
+    ?assertMatch(#{<<"kind">> := <<"family">>, <<"pattern">> := <<"{n}.stg.content-loader.com">>,
+                   <<"domain_count">> := 3}, Family),
+    {200, #{<<"dismissed">> := 3}} =
+        json_request(post, "/api/threats/campaigns/dismiss",
+                     maps:with([<<"kind">>, <<"tld">>, <<"leading_label">>, <<"parent">>], Family)),
+    ?assertEqual([<<"0.stg.content-loader.com">>, <<"1.stg.content-loader.com">>,
+                  <<"2.stg.content-loader.com">>],
+                 col(Config, "SELECT domain FROM suspicious_candidates WHERE status = 'dismissed'")),
+    {200, #{<<"suppressions">> := [#{<<"pattern">> := <<"{n}.stg.content-loader.com">>,
+                                     <<"kind">> := <<"family">>}]}} =
+        json_request(get, "/api/threats/campaigns", none),
+
+    Log("9.stg.content-loader.com"),
+    Log("9.stg.other-loader.com"),
+    Found = [maps:get(domain, C) || C <- bifrost_domain_analyzer:find_candidates()],
+    ?assertNot(lists:member(<<"9.stg.content-loader.com">>, Found)),
+    ?assert(lists:member(<<"9.stg.other-loader.com">>, Found)).
+
 %% ── helpers ───────────────────────────────────────────────────
 
 post(Path, Body) -> request(post, Path, Body).
@@ -355,6 +427,10 @@ col(Config, Sql) ->
     {ok, _, Rows} = with_direct(Config, fun(C) -> epgsql:squery(C, Sql ++ " ORDER BY 1") end),
     [V || {V} <- Rows].
 
+rows(Config, Sql) ->
+    {ok, _, Rows} = with_direct(Config, fun(C) -> epgsql:squery(C, Sql) end),
+    Rows.
+
 raw_connect(Db, Name) ->
     {ok, C} = epgsql:connect(maps:get(host, Db), maps:get(user, Db), maps:get(pass, Db),
                              [{port, maps:get(port, Db)}, {database, Name}]),
@@ -370,7 +446,15 @@ wait_connected(N) ->
 stop(Name) ->
     case whereis(Name) of
         undefined -> ok;
-        Pid -> unlink(Pid), exit(Pid, shutdown)
+        %% Wait for it: a registered name still held when the next suite's
+        %% init_per_suite starts the same server is {error, already_started}.
+        Pid ->
+            unlink(Pid),
+            Ref = monitor(process, Pid),
+            exit(Pid, shutdown),
+            receive {'DOWN', Ref, process, Pid, _} -> ok
+            after 5000 -> exit(Pid, kill)
+            end
     end.
 
 getenv(Var, Default) ->
