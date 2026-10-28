@@ -155,6 +155,25 @@ cname_block_shows_the_alias_chain_test() ->
     ?assertEqual(nomatch, binary:match(Row(#{action => <<"NOERROR">>, response_records => Rec}),
                                        <<"via CNAME">>)).
 
+%% HTTPS/SVCB alias blocks: Rust renders the record as "<priority> <target>".
+svcb_block_shows_its_target_test() ->
+    Row = fun(Recs) -> bifrost_view:render_query_log_table(
+                         [maps:merge(entry(), #{response_records => Recs})], 1, 1,
+                         <<"time">>, <<"desc">>) end,
+    Https = Row([#{<<"rtype">> => <<"HTTPS">>, <<"value">> => <<"1 cdn.<tracker>.net.">>}]),
+    ?assert(binary:match(Https, <<"via HTTPS → cdn.&lt;tracker&gt;.net"/utf8>>) =/= nomatch),
+    Svcb = Row([#{<<"rtype">> => <<"SVCB">>, <<"value">> => <<"0 t.example.">>}]),
+    ?assert(binary:match(Svcb, <<"via SVCB → t.example"/utf8>>) =/= nomatch),
+    %% A CNAME anywhere in the chain names it a CNAME block.
+    Mixed = Row([#{<<"rtype">> => <<"CNAME">>, <<"value">> => <<"edge.cdn.example.">>},
+                 #{<<"rtype">> => <<"HTTPS">>, <<"value">> => <<"1 cdn.tracker.net.">>}]),
+    ?assert(binary:match(Mixed, <<"via CNAME → edge.cdn.example → cdn.tracker.net"/utf8>>)
+            =/= nomatch),
+    %% "." is the owner name, not a hop; unparseable values are ignored.
+    [?assertEqual(nomatch, binary:match(Row([#{<<"rtype">> => <<"HTTPS">>, <<"value">> => V}]),
+                                        <<"via ">>))
+     || V <- [<<"1 .">>, <<"garbage">>]].
+
 entry() ->
     #{id => 42, client_ip => <<"192.168.1.10">>, domain => <<"<unsafe>">>,
       qtype => 1, action => <<"BIFROST_BLOCK">>, client_rcode => <<"NXDOMAIN">>,
