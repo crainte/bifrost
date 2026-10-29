@@ -300,7 +300,8 @@ async fn handle_query(
         }
     }
 
-    // CNAME cloaking check on the answer (see blocked_cname): only while
+    // Alias cloaking check on the answer (CNAME, HTTPS, SVCB; see
+    // blocked_alias): only while
     // filtering, and never for an allowlisted query name, which is how an
     // operator unblocks a cloaked name from the query log.
     let mut check_cnames = protection_enabled;
@@ -372,10 +373,10 @@ async fn handle_query(
             // listed, or propagated from a peer, must not bypass the block.
             if check_cnames {
                 if let Some(msg) = cached_msg.as_ref() {
-                    if let Some((target, list_id)) = blocked_cname(msg, &s.blocklist, &s.allowlist)
+                    if let Some((target, list_id)) = blocked_alias(msg, &s.blocklist, &s.allowlist)
                     {
                         drop(s);
-                        return cname_block(
+                        return alias_block(
                             &request,
                             mode,
                             msg,
@@ -486,10 +487,10 @@ async fn handle_query(
         if let Some(msg) = upstream_msg.as_ref() {
             let hit = {
                 let s = state.read().await;
-                blocked_cname(msg, &s.blocklist, &s.allowlist)
+                blocked_alias(msg, &s.blocklist, &s.allowlist)
             };
             if let Some((target, list_id)) = hit {
-                return cname_block(
+                return alias_block(
                     &request,
                     mode,
                     msg,
@@ -554,38 +555,78 @@ async fn handle_query(
     Ok(upstream_response)
 }
 
-/// CNAME cloaking: a tracker served behind a first-party name
-/// (metrics.shop.com CNAME c1.tracker.net). Returns `(target, list_id)` for the
-/// first CNAME target in the answer that the blocklist (including manual
-/// blocks, which load as the `manual` list) covers, with the same semantics as
-/// the query check: most specific entry, same-list `@@` exceptions honoured,
-/// and an allowlisted target is never blocked. Per-client blocks are not
-/// applied to targets, so a cached answer means the same for every client.
-fn blocked_cname(
+/// Alias cloaking: a tracker served behind a first-party name, either by CNAME
+/// (metrics.shop.com CNAME c1.tracker.net) or by an HTTPS/SVCB record naming
+/// another host (metrics.shop.com HTTPS 1 cdn.tracker.net., RFC 9460), which
+/// browsers follow just the same. Returns `(target, list_id)` for the first
+/// alias target in the answer that the blocklist (including manual blocks,
+/// which load as the `manual` list) covers, with the same semantics as the
+/// query check: most specific entry, same-list `@@` exceptions honoured, and an
+/// allowlisted target is never blocked. Per-client blocks are not applied to
+/// targets, so a cached answer means the same for every client.
+///
+/// SVCB ipv4hint/ipv6hint are NOT checked: they are addresses, which belongs
+/// with answer-IP blocking (TODO.md).
+fn blocked_alias(
     msg: &Message,
     blocklist: &crate::blocklist::Blocklist,
     allowlist: &crate::allowlist::Allowlist,
 ) -> Option<(String, String)> {
-    msg.answers.iter().find_map(|r| match &r.data {
-        RData::CNAME(c) => {
-            let target = c.0.to_ascii().to_ascii_lowercase();
-            let target = target.trim_end_matches('.');
-            if allowlist.contains(target) {
-                return None;
-            }
-            blocklist
-                .contains(target)
-                .map(|id| (target.to_string(), id.to_string()))
+    msg.answers.iter().find_map(|r| {
+        let target = alias_target(&r.data)?;
+        if allowlist.contains(&target) {
+            return None;
         }
-        _ => None,
+        blocklist
+            .contains(&target)
+            .map(|id| (target.clone(), id.to_string()))
     })
+}
+
+/// The host an answer record redirects the client to, lowercase wire form
+/// without the trailing dot, or None if the record is not an alias.
+fn alias_target(data: &RData) -> Option<String> {
+    match data {
+        RData::CNAME(c) => Some(normalized(&c.0)),
+        _ => svcb_alias_target(data),
+    }
+}
+
+/// HTTPS/SVCB TargetName, in AliasMode (priority 0) and ServiceMode alike. The
+/// root name "." means "the owner name itself", which the query check already
+/// covered, so it is not a target of its own.
+fn svcb_alias_target(data: &RData) -> Option<String> {
+    let svcb = match data {
+        RData::HTTPS(h) => &h.0,
+        RData::SVCB(s) => s,
+        _ => return None,
+    };
+    if svcb.target_name.is_root() {
+        return None;
+    }
+    Some(normalized(&svcb.target_name))
+}
+
+fn svcb_summary(svcb: &hickory_proto::rr::rdata::SVCB) -> String {
+    format!(
+        "{} {}",
+        svcb.svc_priority,
+        svcb.target_name.to_ascii().to_ascii_lowercase()
+    )
+}
+
+fn normalized(name: &Name) -> String {
+    name.to_ascii()
+        .to_ascii_lowercase()
+        .trim_end_matches('.')
+        .to_string()
 }
 
 /// The configured block response for a cloaked answer. Logged as an ordinary
 /// BIFROST_BLOCK attributed to the list that matched the TARGET, with the
 /// answer's records attached so the query log can show the CNAME.
 #[allow(clippy::too_many_arguments)]
-fn cname_block(
+fn alias_block(
     request: &Message,
     mode: &BlockMode,
     answer: &Message,
@@ -832,6 +873,10 @@ fn extract_response_records(msg: &Message) -> Vec<ResponseRecord> {
                     "{} {} {} {}",
                     srv.priority, srv.weight, srv.port, srv.target
                 ),
+                // "<priority> <target>": enough to show where a browser is
+                // sent (and why an alias block fired), without the params dump.
+                RData::HTTPS(h) => svcb_summary(&h.0),
+                RData::SVCB(s) => svcb_summary(s),
                 data => format!("{:?}", data),
             };
             ResponseRecord { rtype, value }
@@ -1418,12 +1463,12 @@ mod tests {
     }
 
     #[test]
-    fn blocked_cname_finds_any_target_in_the_chain() {
+    fn blocked_alias_finds_any_target_in_the_chain() {
         let mut bl = crate::blocklist::Blocklist::new();
         bl.load("trackers", vec!["tracker.net".into()]);
         let al = crate::allowlist::Allowlist::new();
         assert_eq!(
-            blocked_cname(
+            blocked_alias(
                 &cname_chain(&["edge.cdn.example.", "c1.Tracker.NET."]),
                 &bl,
                 &al
@@ -1431,17 +1476,17 @@ mod tests {
             Some(("c1.tracker.net".into(), "trackers".into()))
         );
         assert_eq!(
-            blocked_cname(&cname_chain(&["edge.cdn.example."]), &bl, &al),
+            blocked_alias(&cname_chain(&["edge.cdn.example."]), &bl, &al),
             None
         );
         assert_eq!(
-            blocked_cname(&query("metrics.shop.com.", RecordType::A), &bl, &al),
+            blocked_alias(&query("metrics.shop.com.", RecordType::A), &bl, &al),
             None
         );
     }
 
     #[test]
-    fn blocked_cname_honours_the_allowlist_and_list_exceptions() {
+    fn blocked_alias_honours_the_allowlist_and_list_exceptions() {
         let mut bl = crate::blocklist::Blocklist::new();
         bl.load(
             "trackers",
@@ -1450,7 +1495,7 @@ mod tests {
         let mut al = crate::allowlist::Allowlist::new();
         al.load(vec!["c2.tracker.net".into()]);
         for t in ["a.safe.tracker.net.", "c2.tracker.net."] {
-            assert_eq!(blocked_cname(&cname_chain(&[t]), &bl, &al), None, "{t}");
+            assert_eq!(blocked_alias(&cname_chain(&[t]), &bl, &al), None, "{t}");
         }
     }
 
@@ -1494,7 +1539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_protection_does_not_cname_block() {
+    async fn paused_protection_does_not_alias_block() {
         let st = state_with_upstream(cloaked_to_tracker).await;
         st.write()
             .await
@@ -1535,6 +1580,177 @@ mod tests {
         assert_eq!(ev.len(), 1);
         assert!(matches!(ev[0].action, Action::BifrostBlock));
         assert_eq!(ev[0].list_id.as_deref(), Some("trackers"));
+    }
+
+    // ── HTTPS / SVCB aliasing ───────────────────────────────────
+    //
+    // RFC 9460: `1 cdn.tracker.net. alpn=h2` on an HTTPS/SVCB record tells the
+    // browser to connect to that target instead. Same cloak as a CNAME.
+
+    fn svcb_answer(req: &Message, rtype: RecordType, priority: u16, target: &str) -> Message {
+        use hickory_proto::rr::rdata::{HTTPS, SVCB};
+        let svcb = SVCB::new(priority, Name::from_ascii(target).unwrap(), vec![]);
+        let data = if rtype == RecordType::HTTPS {
+            RData::HTTPS(HTTPS(svcb))
+        } else {
+            RData::SVCB(svcb)
+        };
+        let mut r = Message::new(0, MessageType::Response, hickory_proto::op::OpCode::Query);
+        r.add_answer(Record::from_rdata(req.queries[0].name().clone(), 300, data));
+        r
+    }
+
+    fn https_to_tracker(req: &Message) -> Message {
+        svcb_answer(req, RecordType::HTTPS, 1, "Cdn.Tracker.NET.")
+    }
+
+    fn https_to_clean(req: &Message) -> Message {
+        svcb_answer(req, RecordType::HTTPS, 1, "edge.cdn.example.")
+    }
+
+    #[test]
+    fn blocked_alias_checks_https_and_svcb_targets() {
+        let mut bl = crate::blocklist::Blocklist::new();
+        bl.load(
+            "trackers",
+            vec!["tracker.net".into(), "@@safe.tracker.net".into()],
+        );
+        let mut al = crate::allowlist::Allowlist::new();
+        al.load(vec!["ok.tracker.net".into()]);
+        let q = query("metrics.shop.com.", RecordType::HTTPS);
+        for rtype in [RecordType::HTTPS, RecordType::SVCB] {
+            // AliasMode (0) and ServiceMode (1) both name a target.
+            for prio in [0, 1] {
+                assert_eq!(
+                    blocked_alias(&svcb_answer(&q, rtype, prio, "Cdn.Tracker.NET."), &bl, &al),
+                    Some(("cdn.tracker.net".into(), "trackers".into())),
+                    "{rtype} prio {prio}"
+                );
+            }
+            for clean in [
+                "edge.cdn.example.",
+                "a.safe.tracker.net.",
+                "ok.tracker.net.",
+            ] {
+                assert_eq!(
+                    blocked_alias(&svcb_answer(&q, rtype, 1, clean), &bl, &al),
+                    None,
+                    "{rtype} {clean}"
+                );
+            }
+            // "." in ServiceMode means "the owner name", which the query
+            // check already covers; it is not a target of its own.
+            assert_eq!(
+                blocked_alias(&svcb_answer(&q, rtype, 1, "."), &bl, &al),
+                None
+            );
+        }
+    }
+
+    /// The root target must be skipped explicitly, not merely fail to match:
+    /// a list holding "" (or a future root-matching rule) must not block it.
+    #[test]
+    fn root_svcb_target_is_never_a_target() {
+        let q = query("metrics.shop.com.", RecordType::HTTPS);
+        let msg = svcb_answer(&q, RecordType::HTTPS, 1, ".");
+        assert_eq!(svcb_alias_target(&msg.answers[0].data), None);
+        let msg = svcb_answer(&q, RecordType::HTTPS, 1, "T.example.");
+        assert_eq!(
+            svcb_alias_target(&msg.answers[0].data).as_deref(),
+            Some("t.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn https_record_into_a_blocklist_is_blocked_and_never_cached() {
+        let st = state_with_upstream(https_to_tracker).await;
+        st.write()
+            .await
+            .blocklist
+            .load("trackers", vec!["tracker.net".into()]);
+        let (resp, sent) =
+            run_collecting(&st, &query("metrics.shop.com.", RecordType::HTTPS)).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+        assert!(resp.answers.is_empty(), "tracker target reached the client");
+        assert_eq!(cache_stores(&sent), 0);
+        let ev = events(&sent);
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(ev[0].action, Action::BifrostBlock));
+        assert_eq!(ev[0].qtype, 65);
+        assert_eq!(ev[0].ede_code, Some(15));
+        assert_eq!(ev[0].list_id.as_deref(), Some("trackers"));
+        // The query log shows WHY: the record's priority and target.
+        assert!(ev[0].response_records.as_ref().is_some_and(|r| r
+            .iter()
+            .any(|x| x.rtype == "HTTPS" && x.value == "1 cdn.tracker.net.")));
+        assert!(st
+            .read()
+            .await
+            .cache
+            .lookup("metrics.shop.com:65")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn clean_https_record_passes_through_and_is_cached() {
+        let st = state_with_upstream(https_to_clean).await;
+        st.write()
+            .await
+            .blocklist
+            .load("trackers", vec!["tracker.net".into()]);
+        let (resp, sent) =
+            run_collecting(&st, &query("metrics.shop.com.", RecordType::HTTPS)).await;
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(cache_stores(&sent), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_https_answer_is_blocked_on_hit() {
+        let st = test_state();
+        {
+            let mut s = st.write().await;
+            s.ready = true;
+            let cached = https_to_tracker(&query("metrics.shop.com.", RecordType::HTTPS));
+            s.cache.insert(
+                "metrics.shop.com:65".into(),
+                cached.to_bytes().unwrap(),
+                300,
+            );
+            s.blocklist.load("trackers", vec!["tracker.net".into()]);
+        }
+        let (resp, sent) =
+            run_collecting(&st, &query("metrics.shop.com.", RecordType::HTTPS)).await;
+        assert!(resp.answers.is_empty());
+        let ev = events(&sent);
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(ev[0].action, Action::BifrostBlock));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_name_keeps_its_https_record() {
+        let st = state_with_upstream(https_to_tracker).await;
+        {
+            let mut s = st.write().await;
+            s.blocklist.load("trackers", vec!["tracker.net".into()]);
+            s.allowlist.load(vec!["metrics.shop.com".into()]);
+        }
+        let resp = run_handler(&st, &query("metrics.shop.com.", RecordType::HTTPS)).await;
+        assert_eq!(resp.answers.len(), 1);
+    }
+
+    #[test]
+    fn response_records_render_svcb_as_priority_and_target() {
+        let q = query("a.example.", RecordType::HTTPS);
+        let recs = extract_response_records(&svcb_answer(&q, RecordType::HTTPS, 1, "T.example."));
+        assert_eq!(
+            (recs[0].rtype.as_str(), recs[0].value.as_str()),
+            ("HTTPS", "1 t.example.")
+        );
+        let recs = extract_response_records(&svcb_answer(&q, RecordType::SVCB, 0, "t.example."));
+        assert_eq!(
+            (recs[0].rtype.as_str(), recs[0].value.as_str()),
+            ("SVCB", "0 t.example.")
+        );
     }
 
     #[tokio::test]

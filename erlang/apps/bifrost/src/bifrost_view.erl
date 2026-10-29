@@ -117,19 +117,36 @@ result_note(_, _, _) -> <<"">>.
 
 note(Text) -> [<<"<span class=\"ql-sub\">">>, Text, <<"</span>">>].
 
-%% A block that carries answer records is a CNAME-cloaking block: Rust only
-%% attaches records to a block when the upstream answer's CNAME target was the
-%% blocked name. Shows the whole alias chain, since any hop may be the one
-%% that matched (the Blocklist detail names the list).
+%% A block that carries answer records is an alias-cloaking block: Rust only
+%% attaches records to a block when a CNAME, HTTPS or SVCB target in the
+%% upstream answer was the blocked name. Shows the whole alias chain, since any
+%% hop may be the one that matched (the Blocklist detail names the list).
+%% HTTPS/SVCB values are "<priority> <target>"; a "." target means the owner
+%% name and is not a hop.
 cname_note(<<"BIFROST_BLOCK">>, Records) when is_list(Records) ->
-    case [V || #{<<"rtype">> := <<"CNAME">>, <<"value">> := V} <- Records, is_binary(V)] of
+    Hops = lists:filtermap(fun alias_hop/1, Records),
+    case Hops of
         [] -> <<"">>;
-        Targets ->
-            Chain = lists:join(<<" → "/utf8>>,
-                               [escape_h(string:trim(T, trailing, ".")) || T <- Targets]),
-            note([<<"via CNAME → "/utf8>> | Chain])
+        _ ->
+            Kind = case lists:keymember(<<"CNAME">>, 1, Hops) of
+                true -> <<"CNAME">>;
+                false -> element(1, hd(Hops))
+            end,
+            Chain = lists:join(<<" → "/utf8>>, [escape_h(T) || {_, T} <- Hops]),
+            note([<<"via ", Kind/binary, " → "/utf8>> | Chain])
     end;
 cname_note(_, _) -> <<"">>.
+
+alias_hop(#{<<"rtype">> := <<"CNAME">>, <<"value">> := V}) when is_binary(V) ->
+    {true, {<<"CNAME">>, string:trim(V, trailing, ".")}};
+alias_hop(#{<<"rtype">> := T, <<"value">> := V})
+  when (T =:= <<"HTTPS">> orelse T =:= <<"SVCB">>), is_binary(V) ->
+    case binary:split(V, <<" ">>) of
+        [_Prio, Target] when Target =/= <<".">>, Target =/= <<>> ->
+            {true, {T, string:trim(Target, trailing, ".")}};
+        _ -> false
+    end;
+alias_hop(_) -> false.
 
 action_badge(undefined, _Display) ->
     badge_span(<<"pill-muted">>, <<"Unknown">>);
