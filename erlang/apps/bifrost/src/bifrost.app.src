@@ -1,6 +1,6 @@
 {application, bifrost, [
     {description, "Bifrost DNS — control plane"},
-    {vsn, "0.2.2"},
+    {vsn, "0.3.0"},
     {registered, []},
     {mod, {bifrost_app, []}},
     {applications, [
