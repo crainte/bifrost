@@ -188,10 +188,10 @@ with_state(Rules) ->
 %% pattern), the pattern text the operator confirmed, and `confirm: true`.
 %% Anything stale, malformed or unconfirmed installs nothing.
 validate_block(Body, Campaigns) when is_map(Body), is_list(Campaigns) ->
-    Client = case maps:get(<<"client_ip">>, Body, null) of
-        null -> {ok, null};
-        <<>> -> {ok, null};
-        Ip -> parse_ip(Ip)
+    Client = case maps:find(<<"client_ip">>, Body) of
+        {ok, null} -> {ok, null};
+        {ok, Ip} -> parse_ip(Ip);
+        error -> error
     end,
     case {maps:get(<<"confirm">>, Body, false), pattern(Body), Client} of
         {true, {ok, Pattern}, {ok, ClientIp}} ->

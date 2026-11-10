@@ -23,7 +23,7 @@
 %% (revision 0, no rules) hydrates normally.
 
 -export([start_link/0, publish/1, refresh/0, sync/0, apply_current/0, handle_ack/2,
-         status/0, cluster_status/0, rule_state/2, admission_status/1]).
+         status/0, cluster_status/0, rule_state/2, admission_status/1, effective_revision/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(KEY, campaign_blocks).
@@ -88,6 +88,7 @@ cluster_status() ->
 admission_status(Statuses) ->
     case lists:any(fun(S) ->
         maps:get(state, S, undefined) =:= <<"offline">> orelse
+        (maps:get(connected, S, false) =:= false andalso maps:get(had_ack, S, false) =:= true) orelse
         (maps:get(connected, S, false) =:= true andalso
          (maps:get(state, S, undefined) =/= <<"applied">> orelse
           maps:get(applied_revision, S, undefined) =:= undefined))
@@ -157,7 +158,7 @@ handle_cast({ack, ConnId, Message}, State = #state{pending = {ConnId, Revision, 
             cancel(Timer),
             reply(From, ok),
             {noreply, State#state{pending = undefined, last_error = undefined, retry = undefined,
-                                  applied = #{revision => Revision,
+                                  applied = #{revision => Revision, connection_id => ConnId,
                                               at => erlang:system_time(second)}}};
         #{<<"type">> := <<"campaign_blocks_rejected">>, <<"revision">> := Revision} = Rejected ->
             cancel(Timer),
@@ -272,14 +273,22 @@ send_current(State = #state{desired = #{revision := Revision, rules := Rules}}, 
 valid_snapshot(#{revision := R, rules := L}) when is_integer(R), R >= 0, is_list(L) -> true;
 valid_snapshot(_) -> false.
 
+%% An ACK belongs to the Rust socket that received the policy. A disconnected
+%% or replaced socket cannot substantiate enforcement on the current resolver.
+effective_revision(#{revision := Revision, connection_id := ConnId}, ConnId)
+  when ConnId =/= undefined -> Revision;
+effective_revision(_, _) -> undefined.
+
 local_status(#state{desired = D, applied = A, pending = P, last_error = Err}) ->
     DesiredRev = case D of undefined -> undefined; _ -> maps:get(revision, D) end,
-    AppliedRev = case A of undefined -> undefined; _ -> maps:get(revision, A) end,
-    Connected = case catch bifrost_socket_server:connection_id() of
-                    Id when Id =/= undefined, not is_tuple(Id) -> true;
-                    _ -> false
-                end,
-    #{connected => Connected, desired_revision => DesiredRev,
+    ConnId = case catch bifrost_socket_server:connection_id() of
+                 Id when Id =/= undefined, not is_tuple(Id) -> Id;
+                 _ -> undefined
+             end,
+    Connected = ConnId =/= undefined,
+    AppliedRev = effective_revision(A, ConnId),
+    #{connected => Connected, had_ack => A =/= undefined,
+      desired_revision => DesiredRev,
       applied_revision => AppliedRev,
       state => if
                    P =/= undefined -> <<"applying">>;
