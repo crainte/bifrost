@@ -45,6 +45,16 @@ init([]) ->
         shutdown => 5000
     },
 
+    %% Campaign-block rule set -> Rust, with per-node applied status. Before
+    %% blocklist_manager, whose hydration waits for its acknowledgement.
+    CampaignPolicy = #{
+        id => campaign_policy,
+        start => {bifrost_campaign_policy, start_link, []},
+        type => worker,
+        restart => permanent,
+        shutdown => 5000
+    },
+
     BlocklistManager = #{
         id => blocklist_manager,
         start => {bifrost_blocklist_manager, start_link, []},
@@ -132,6 +142,7 @@ init([]) ->
         DbPool,
         ClusterManager,
         DnsSettings,
+        CampaignPolicy,
         BlocklistManager,
         RustSupervisor,
         UpstreamMonitor,

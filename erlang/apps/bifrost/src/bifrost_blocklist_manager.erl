@@ -73,6 +73,10 @@ handle_cast(client_connected, State = #state{hydrated = TimerArmed}) ->
     try
         Config = get_config(),
         ok = bifrost_dns_settings_server:apply_current(),
+        %% Campaign blocks fail closed: no acknowledged rule set (and no
+        %% last-known snapshot) means no reload_complete, so this node never
+        %% serves with an unknown policy treated as empty. Retried like the rest.
+        ok = bifrost_campaign_policy:apply_current(),
         send_acl(Config),
         load_blocklists(),
         %% Push operational config that lives in Postgres (survives restart).
@@ -193,6 +197,12 @@ handle_info({mnesia_table_event, {write, {cache_evict, Domain, _Nonce}, _Activit
 handle_info({mnesia_table_event, {write, {config_reload, blocklists, _Nonce}, _ActivityId}}, State) ->
     logger:info("blocklist reload propagated, re-syncing local Rust"),
     _ = catch sync_blocklists_to_rust(),
+    {noreply, State};
+%% Campaign-block change on another node: re-read the policy and push it. Not
+%% the generic clause below, which would re-push everything for no reason.
+handle_info({mnesia_table_event, {write, {config_reload, campaign_blocks, _Nonce}, _ActivityId}}, State) ->
+    logger:info("campaign block reload propagated, re-syncing local Rust"),
+    bifrost_campaign_policy:sync(),
     {noreply, State};
 %% Operational-config reload event: another node changed manual blocks /
 %% allowlist / rewrites / client blocks in Postgres. Re-push all of it to THIS

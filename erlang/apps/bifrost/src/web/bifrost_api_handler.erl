@@ -202,6 +202,37 @@ handle_request(<<"POST">>, Req0, [threat_campaigns_dismiss]) ->
         _ -> respond(400, #{error => <<"invalid body">>}, Req0)
     end;
 
+%% Explicit DNS block of a campaign pattern. Distinct from dismiss: this changes
+%% resolution. 200 with state `applying` means SAVED and being distributed, not
+%% yet enforced everywhere; the page polls the state.
+handle_request(<<"POST">>, Req0, [threat_campaigns_block]) ->
+    {ok, Body, _} = cowboy_req:read_body(Req0),
+    case decode_json(Body) of
+        Map when is_map(Map) ->
+            case bifrost_threat_campaigns:block(Map) of
+                {ok, Rule} -> respond(200, Rule#{ok => true}, Req0);
+                {error, {bad_request, Reason}} -> respond(400, #{error => Reason}, Req0);
+                {error, resolver_not_ready} -> respond(503, #{error => <<"resolver has not acknowledged campaign policy">>}, Req0);
+                {error, database} -> respond(500, #{error => <<"db error">>}, Req0)
+            end;
+        _ -> respond(400, #{error => <<"invalid body">>}, Req0)
+    end;
+
+handle_request(<<"POST">>, Req0, [threat_campaign_blocks_revoke]) ->
+    {ok, Body, _} = cowboy_req:read_body(Req0),
+    case decode_json(Body) of
+        #{<<"id">> := Id} ->
+            case bifrost_threat_campaigns:revoke_block(Id) of
+                {ok, #{distribution := <<"saved_not_distributed">>} = Result} ->
+                    respond(503, Result#{ok => false, saved => true}, Req0);
+                {ok, #{state := revoked} = Result} -> respond(200, Result#{ok => true}, Req0);
+                {ok, Result} -> respond(202, Result#{ok => true, saved => true}, Req0);
+                {error, not_found} -> respond(404, #{error => <<"not found">>}, Req0);
+                {error, database} -> respond(500, #{error => <<"db error">>}, Req0)
+            end;
+        _ -> respond(400, #{error => <<"missing id">>}, Req0)
+    end;
+
 handle_request(<<"POST">>, Req0, [threat_suppressions_revoke]) ->
     {ok, Body, _} = cowboy_req:read_body(Req0),
     case decode_json(Body) of

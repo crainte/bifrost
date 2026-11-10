@@ -38,6 +38,8 @@ routes() ->
             {"/api/threats/campaigns", bifrost_api_handler, [threat_campaigns]},
             {"/api/threats/campaigns/dismiss", bifrost_api_handler, [threat_campaigns_dismiss]},
             {"/api/threats/suppressions/revoke", bifrost_api_handler, [threat_suppressions_revoke]},
+            {"/api/threats/campaigns/block", bifrost_api_handler, [threat_campaigns_block]},
+            {"/api/threats/campaign-blocks/revoke", bifrost_api_handler, [threat_campaign_blocks_revoke]},
             {"/api/threats/scan",     bifrost_api_handler, [threats_scan]},
             {"/api/threats/settings", bifrost_api_handler, [threats_settings]},
             {"/api/blocklists/refresh", bifrost_api_handler, [blocklists_refresh]},

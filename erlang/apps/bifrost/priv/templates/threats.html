@@ -9,19 +9,30 @@
 
     <section id="sec-campaigns" class="st-section" aria-labelledby="campaigns-title">
       <header class="st-section__head">
-        <div><h2 id="campaigns-title">Campaigns</h2><p>Groups of generated hostnames. A <strong>family</strong> is numbered siblings under one parent, such as <code>{n}.stg.content-loader.com</code>. A <strong>marker</strong> campaign is the same label across at least three different registered domains, such as <code>447.*.site</code>. Dismissing a campaign hides matching hostnames from review until it expires. It does not allow or block DNS.</p></div>
+        <div><h2 id="campaigns-title">Campaigns</h2><p>Groups of generated hostnames. A <strong>family</strong> is numbered siblings under one parent, such as <code>{n}.stg.content-loader.com</code>. A <strong>marker</strong> campaign is the same label across at least three different registered domains, such as <code>447.*.site</code>. <strong>Dismiss</strong> only hides matching hostnames from review until it expires; DNS is unchanged. <strong>Block campaign</strong> is a separate, explicit DNS rule: it denies every hostname matching the pattern, including names nobody has queried yet.</p></div>
       </header>
       <div class="table-wrap"><table class="data-table">
         <thead><tr>
           <th>Pattern</th><th style="width:90px;text-align:right">Domains</th><th style="width:90px;text-align:right">Queries</th>
-          <th>Scope</th><th style="width:120px">Hide for</th><th style="width:110px"></th>
+          <th>Scope</th><th style="width:120px">Dismiss for</th><th style="width:230px"></th>
         </tr></thead>
         <tbody id="c-rows"><tr><td colspan="6" class="st-empty">Loading…</td></tr></tbody>
       </table></div>
     </section>
 
+    <section id="sec-campaign-blocks" class="st-section" aria-labelledby="campaign-blocks-title">
+      <header class="st-section__head">
+        <div><h2 id="campaign-blocks-title">Campaign blocks and pending revocations</h2><p>DNS rules created with <strong>Block campaign</strong>. They deny matching hostnames, including ones not yet seen. A rule is only <em>enforced</em> once each resolver confirms it. Revocations remain visible until every resolver confirms removal; exact-domain blocks and suppressions are not affected.</p></div>
+      </header>
+      <div class="table-wrap"><table class="data-table">
+        <thead><tr><th>Pattern</th><th>Scope</th><th style="width:110px;text-align:right">Seen at block</th><th style="width:260px">Status</th><th style="width:170px">Since</th><th style="width:90px"></th></tr></thead>
+        <tbody id="b-rows"><tr><td colspan="6" class="st-empty">Loading…</td></tr></tbody>
+      </table></div>
+    </section>
+
     <section id="sec-suppressions" class="st-section" aria-labelledby="suppressions-title">
       <header class="st-section__head"><h2 id="suppressions-title">Active suppressions</h2></header>
+      <p class="section-kicker">Review-only: these hide hostnames from the queue and never change DNS.</p>
       <div class="table-wrap"><table class="data-table">
         <thead><tr><th>Pattern</th><th>Scope</th><th style="width:90px;text-align:right">Dismissed</th><th style="width:170px">Expires</th><th style="width:90px"></th></tr></thead>
         <tbody id="s-rows"><tr><td colspan="5" class="st-empty">Loading…</td></tr></tbody>
@@ -113,7 +124,7 @@
   function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
   function post(url, body) {
     return fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})})
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json().catch(function () { return {}; }); });
+      .then(function (r) { if (!r.ok) return r.json().catch(function () { return {}; }).then(function (body) { var e = new Error('HTTP ' + r.status); e.saved = body.saved; throw e; }); return r.json().catch(function () { return {}; }); });
   }
   function toast(msg, kind) {
     var bar = $('t-status'); $('t-status-text').textContent = msg; bar.className = 'st-savebar ' + (kind || '');
@@ -278,17 +289,69 @@
       [[7, '7 days'], [30, '30 days'], [90, '90 days']].forEach(function (d) { var o = make('option', null, d[1]); o.value = d[0]; if (d[0] === 30) o.selected = true; days.appendChild(o); });
       var c5 = make('td'); c5.appendChild(days);
       var btn = make('button', 'btn btn-secondary btn-sm', 'Dismiss'); btn.type = 'button';
+      btn.title = 'Review only: hides this pattern from the queue. DNS is not changed.';
       btn.onclick = function () {
         var who = scope.value ? 'from ' + scope.value : 'from all clients';
-        if (!confirm('Hide ' + c.pattern + ' ' + who + ' for ' + days.value + ' days? DNS is not changed.')) return;
+        if (!confirm('Hide ' + c.pattern + ' ' + who + ' from review for ' + days.value + ' days? This does NOT block anything: DNS is not changed.')) return;
         btn.disabled = true;
         post('/api/threats/campaigns/dismiss', {kind: c.kind, tld: c.tld, leading_label: c.leading_label, parent: c.parent, client_ip: scope.value || null, days: Number(days.value)})
           .then(function (r) { toast(c.pattern + ': ' + r.dismissed + ' dismissed until ' + new Date(r.expires_at).toLocaleDateString() + '.'); refresh(); })
           .catch(function () { btn.disabled = false; toast('Could not dismiss ' + c.pattern + '.', 'error'); });
       };
-      var c6 = make('td'); c6.appendChild(btn);
+      var blockBtn = make('button', 'btn btn-danger btn-sm', 'Block campaign'); blockBtn.type = 'button';
+      blockBtn.title = 'Deny this pattern in DNS, including hostnames not seen yet.';
+      blockBtn.onclick = function () {
+        var text = blockConfirmText(c, scope.value);
+        if (!confirm(text)) return;
+        blockBtn.disabled = true;
+        post('/api/threats/campaigns/block', {kind: c.kind, tld: c.tld, leading_label: c.leading_label, parent: c.parent, pattern: c.pattern, client_ip: scope.value || null, confirm: true})
+          .then(function (r) {
+            toast(c.pattern + ' (' + (scope.value ? 'only ' + scope.value : 'all clients') + '): ' + (r.distribution !== 'published' ? 'Saved, but distribution FAILED; retrying.' : r.state === 'failed' ? 'Application FAILED on a resolver; retrying.' : r.state === 'applied' ? 'Enforced on every resolver.' : 'Saved; waiting for resolvers to confirm.'), r.distribution !== 'published' || r.state === 'failed' ? 'error' : undefined);
+            refresh();
+          })
+          .catch(function () { blockBtn.disabled = false; toast('Could not block ' + c.pattern + '. The campaign may have changed; reload and try again.', 'error'); });
+      };
+      var c6 = make('td'), acts = make('div', 't-actions'); acts.append(btn, blockBtn); c6.appendChild(acts);
+      (c.blocked_by || []).forEach(function (b) { c6.appendChild(make('div', 'section-kicker', 'Blocked: ' + (b.client_ip ? 'only ' + b.client_ip : 'all clients') + ' (' + stateText(b.state) + ')')); });
       tr.append(c1, c2, c3, c4, c5, c6); rows.appendChild(tr);
     });
+  }
+  function blockConfirmText(c, client) {
+    var who = client ? 'only for client ' + client : 'for ALL clients';
+    var t = 'Block campaign ' + c.pattern + ' ' + who + '?\n\n' +
+      'This changes DNS. Every hostname matching the pattern will be denied at resolution, including names that are not in today\'s list of ' + c.domain_count + ' observed hostnames and have never been queried.\n';
+    if (c.kind === 'marker') {
+      t += '\nThis marker rule reaches matching hostnames under OTHER registrable .' + c.tld + ' domains too (' + c.leading_label + '.anything.' + c.tld + '), not just the domains seen so far.\n';
+    }
+    return t + '\nAllowlisted names and paused filtering still take precedence. You can revoke the rule at any time.';
+  }
+  function stateText(s) {
+    return s === 'revoking' ? 'Revocation pending; some resolvers may still block' : s === 'revoke_failed' ? 'Revocation FAILED; some resolvers may still block' : s === 'applied' ? 'enforced on all resolvers' : s === 'failed' ? 'FAILED on a resolver, retrying' : 'applying, not yet confirmed everywhere';
+  }
+  var blockTimer;
+  function renderBlocks(list, available) {
+    var rows = $('b-rows'); clear(rows);
+    if (!available) return emptyRow(rows, 6, 'Could not load campaign blocks. Their state is unknown.', 'error-state');
+    if (!list.length) return emptyRow(rows, 6, 'No campaign blocks or pending revocations.');
+    var unsettled = false;
+    list.forEach(function (b) {
+      if (b.state !== 'applied') unsettled = true;
+      var tr = make('tr'), btn = make('button', 'btn btn-ghost btn-sm', 'Revoke'); btn.type = 'button';
+      btn.onclick = function () {
+        if (!confirm('Request revocation of the DNS block for ' + b.pattern + ' (' + (b.client_ip ? 'only ' + b.client_ip : 'all clients') + ')? Some resolvers may keep blocking until they confirm removal. Other rules or lists may still block matching names.')) return;
+        btn.disabled = true;
+        post('/api/threats/campaign-blocks/revoke', {id: b.id}).then(function (r) { toast(r.state === 'revoked' ? b.pattern + ' revoked on all resolvers.' : r.state === 'revoke_failed' ? b.pattern + ': revocation application FAILED; retrying. Some resolvers may still block.' : b.pattern + ': revocation saved; waiting for resolver confirmation.', r.state === 'revoke_failed' ? 'error' : undefined); refresh(); })
+          .catch(function (e) { btn.disabled = false; toast(e.saved ? b.pattern + ': revocation saved, but distribution FAILED; retrying. Some resolvers may still block.' : 'Could not revoke.', 'error'); refresh(); });
+      };
+      if (b.state === 'revoking' || b.state === 'revoke_failed') btn.textContent = 'Retry revoke';
+      var seen = make('td', null, b.observed_domains); seen.style.textAlign = 'right';
+      var act = make('td'); act.appendChild(btn);
+      tr.append(make('td', 't-domain', b.pattern), make('td', null, b.client_ip ? 'Only ' + b.client_ip : 'All clients'), seen,
+                make('td', null, stateText(b.state)), make('td', null, new Date(b.created_at).toLocaleString()), act);
+      rows.appendChild(tr);
+    });
+    clearTimeout(blockTimer);
+    if (unsettled) blockTimer = setTimeout(loadCampaigns, 3000);
   }
   function renderSuppressions(list) {
     var rows = $('s-rows'); clear(rows);
@@ -309,9 +372,9 @@
   }
   function loadCampaigns() {
     return fetch('/api/threats/campaigns').then(function (r) { if (!r.ok) throw new Error(); return r.json(); })
-      .then(function (d) { renderCampaigns(d.campaigns || []); renderSuppressions(d.suppressions || []); })
-      .catch(function () { var c = $('c-rows'), s = $('s-rows'); clear(c); clear(s);
-        emptyRow(c, 6, 'Could not load campaigns.', 'error-state'); emptyRow(s, 5, 'Could not load suppressions.', 'error-state'); });
+      .then(function (d) { renderCampaigns(d.campaigns || []); renderBlocks(d.blocks || [], d.blocks_available !== false); renderSuppressions(d.suppressions || []); })
+      .catch(function () { var c = $('c-rows'), b = $('b-rows'), s = $('s-rows'); clear(c); clear(b); clear(s);
+        emptyRow(c, 6, 'Could not load campaigns.', 'error-state'); emptyRow(b, 6, 'Could not load campaign blocks. Their state is unknown.', 'error-state'); emptyRow(s, 5, 'Could not load suppressions.', 'error-state'); });
   }
 
   fetch('/api/threats/settings').then(function (r) { return r.json(); }).then(applyPolicy).catch(function () {}).then(load);

@@ -228,6 +228,7 @@ resync_after_heal() ->
     _ = catch bifrost_api_handler:push_allowlist(),
     _ = catch bifrost_api_handler:push_rewrites(),
     _ = catch bifrost_api_handler:push_client_blocks(),
+    _ = catch bifrost_campaign_policy:sync(),
     ok.
 
 %% Is clustering configured at all? Deliberately distinct from `seeds() =:= []`:
