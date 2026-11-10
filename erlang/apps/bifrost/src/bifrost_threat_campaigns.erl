@@ -9,9 +9,16 @@
 %% review-only: they keep the analyzer from re-queueing matching traffic, and
 %% never touch DNS allow/block policy. They expire so a recurring campaign is
 %% surfaced again instead of being hidden forever.
+%%
+%% Blocking a campaign is the separate, explicit act in block/1: it stores a
+%% DNS policy rule (bifrost_campaign_block_store) for the same pattern, which
+%% Rust enforces for names never seen before too. It neither dismisses
+%% candidates nor is implied by dismissing them.
 
 -export([classify/1, group/1, validate_dismissal/1,
-         list/0, dismiss/1, revoke/1, suppressed_sql/2]).
+         list/0, dismiss/1, revoke/1, suppressed_sql/2, match_sql/5]).
+%% Explicit DNS blocks (policy, not review): see block/1.
+-export([validate_block/2, block/1, revoke_block/1, with_state/1]).
 
 -define(MIN_DOMAINS, 3).
 -define(DEFAULT_DAYS, 30).
@@ -132,14 +139,176 @@ pattern(_) ->
     {error, <<"missing tld or leading_label">>}.
 
 list() ->
-    Pending = case bifrost_db_pool:equery(
+    Pending = pending_candidates(),
+    {Available, Blocks} = case bifrost_campaign_block_store:active() of
+        {ok, Rules} -> {true, with_state(Rules)};
+        {error, _} -> {false, []}
+    end,
+    #{campaigns => [annotate(C#{clients => clients(maps:get(domains, C))}, Blocks)
+                    || C <- group(Pending)],
+      suppressions => active_suppressions(),
+      blocks => Blocks,
+      blocks_available => Available}.
+
+%% The active blocks that cover this campaign's shape, so the page can show
+%% "blocked" (with scope and state) instead of offering the action again.
+annotate(Campaign, Blocks) ->
+    Covering = [maps:with([id, client_ip, state], B) || B <- Blocks, same_shape(Campaign, B)],
+    Campaign#{blocked_by => Covering}.
+
+same_shape(#{kind := family, parent := P}, #{kind := <<"family">>, parent := P}) -> true;
+same_shape(#{kind := marker, tld := T, leading_label := L},
+           #{kind := <<"marker">>, tld := T, leading_label := L}) -> true;
+same_shape(_, _) -> false.
+
+%% Attach each rule's honest enforcement state: `applied` only once EVERY node
+%% reports having applied a revision >= the rule's; otherwise `applying`, or
+%% `failed` if a node that is behind has reported an error. A missing or
+%% unreachable node keeps it `applying`.
+with_state(Rules) ->
+    Statuses = try bifrost_campaign_policy:cluster_status()
+               catch _:_ -> []
+               end,
+    lists:filtermap(fun(R) ->
+        case maps:get(revoked_revision, R, null) of
+            null -> {true, R#{state => bifrost_campaign_policy:rule_state(maps:get(revision, R), Statuses)}};
+            Rev ->
+                case bifrost_campaign_policy:rule_state(Rev, Statuses) of
+                    applied -> false;
+                    failed -> {true, R#{state => revoke_failed}};
+                    applying -> {true, R#{state => revoking}}
+                end
+        end
+    end, Rules).
+
+%% ── Explicit campaign block ──────────────────────────────────
+
+%% Validate a block request against a FRESH campaign listing. The request must
+%% carry the structured tuple of a currently eligible campaign (never a free-form
+%% pattern), the pattern text the operator confirmed, and `confirm: true`.
+%% Anything stale, malformed or unconfirmed installs nothing.
+validate_block(Body, Campaigns) when is_map(Body), is_list(Campaigns) ->
+    Client = case maps:get(<<"client_ip">>, Body, null) of
+        null -> {ok, null};
+        <<>> -> {ok, null};
+        Ip -> parse_ip(Ip)
+    end,
+    case {maps:get(<<"confirm">>, Body, false), pattern(Body), Client} of
+        {true, {ok, Pattern}, {ok, ClientIp}} ->
+            case find_campaign(Pattern, Campaigns) of
+                {ok, #{pattern := Shown, domain_count := Count}} ->
+                    case maps:get(<<"pattern">>, Body, undefined) =:= Shown
+                         andalso submitted_fields_match(Body, Pattern) of
+                        true ->
+                            {ok, Pattern#{client_ip => ClientIp, observed_domains => Count}};
+                        _ -> {error, <<"pattern does not match the campaign">>}
+                    end;
+                error -> {error, <<"campaign is no longer available to block">>}
+            end;
+        {true, {error, _} = E, _} -> E;
+        {true, _, error} -> {error, <<"invalid client_ip">>};
+        _ -> {error, <<"confirmation required">>}
+    end;
+validate_block(_, _) ->
+    {error, <<"invalid body">>}.
+
+submitted_fields_match(Body, #{kind := family, tld := T}) ->
+    maps:get(<<"tld">>, Body, T) =:= T andalso
+    maps:get(<<"leading_label">>, Body, null) =:= null;
+submitted_fields_match(Body, #{kind := marker}) ->
+    maps:get(<<"parent">>, Body, null) =:= null.
+
+find_campaign(#{kind := family, parent := P}, Campaigns) ->
+    first([C || #{kind := family, parent := Q} = C <- Campaigns, Q =:= P]);
+find_campaign(#{kind := marker, tld := T, leading_label := L}, Campaigns) ->
+    first([C || #{kind := marker, tld := T2, leading_label := L2} = C <- Campaigns,
+                T2 =:= T, L2 =:= L]).
+
+first([C | _]) -> {ok, C};
+first([]) -> error.
+
+%% Persist the rule, then publish it. Returns the rule with `created` and the
+%% honest `state`: activation is "applying" until Rust acknowledges it, never
+%% reported as enforced by the write alone.
+%%   {error, {bad_request, Reason}} validation / stale input, nothing written
+%%   {error, database}              the write failed, nothing is active
+block(Body) ->
+    Pending = pending_candidates(),
+    Campaigns = group(Pending),
+    case validate_block(Body, Campaigns) of
+        {error, Reason} -> {error, {bad_request, Reason}};
+        {ok, #{client_ip := Client} = Pattern} ->
+            {ok, Campaign} = find_campaign(Pattern, Campaigns),
+            case client_in_campaign(Client, maps:get(domains, Campaign)) of
+                false -> {error, {bad_request, <<"client_ip did not query this campaign">>}};
+                true ->
+                    case block_admission() of
+                        ok -> persist_block(Pattern);
+                        {error, _} -> {error, resolver_not_ready}
+                    end
+            end
+    end.
+
+block_admission() ->
+    try bifrost_campaign_policy:admission_status(bifrost_campaign_policy:cluster_status())
+    catch _:_ -> {error, resolver_not_ready}
+    end.
+
+persist_block(Pattern) ->
+    case bifrost_campaign_block_store:activate(Pattern) of
+        {Created, Rule} when Created =:= created; Created =:= existing ->
+            Distribution = publish_change(),
+            [WithState] = with_state([Rule]),
+            {ok, WithState#{created => Created =:= created, distribution => Distribution}};
+        {error, Reason} ->
+            logger:error("campaign block write failed: ~p", [Reason]),
+            {error, database}
+    end.
+
+pending_candidates() ->
+    case bifrost_db_pool:equery(
             "SELECT domain, score, hits FROM suspicious_candidates WHERE status = 'pending'", []) of
         {ok, _, Rows} when is_list(Rows) ->
             [#{domain => D, score => S, hits => H} || {D, S, H} <- Rows];
         _ -> []
-    end,
-    #{campaigns => [C#{clients => clients(maps:get(domains, C))} || C <- group(Pending)],
-      suppressions => active_suppressions()}.
+    end.
+
+client_in_campaign(null, _) -> true;
+client_in_campaign(Client, Domains) ->
+    case bifrost_db_pool:equery(
+            "SELECT 1 FROM query_log WHERE domain = ANY($1::text[]) AND client_ip = $2::inet LIMIT 1",
+            [Domains, Client]) of
+        {ok, _, [_ | _]} -> true;
+        _ -> false
+    end.
+
+revoke_block(Id) ->
+    case bifrost_campaign_block_store:revoke(Id) of
+        {ok, Rule} ->
+            Distribution = publish_change(),
+            case with_state([Rule]) of
+                [] -> {ok, #{state => revoked, distribution => Distribution}};
+                [#{state := State}] -> {ok, #{state => State, distribution => Distribution}}
+            end;
+        {error, not_found} -> {error, not_found};
+        {error, Reason} ->
+            logger:error("campaign block revoke failed: ~p", [Reason]),
+            {error, database}
+    end.
+
+%% After a write: refresh this node (publishes the new revision to the Mnesia
+%% bus every peer subscribes to and pushes to our Rust), and ping peers to
+%% re-read Postgres as a second path. Failure here does NOT undo the saved rule;
+%% it is reported so the caller never presents it as distributed.
+publish_change() ->
+    Result = try bifrost_campaign_policy:refresh()
+             catch _:Reason -> {error, Reason}
+             end,
+    _ = catch bifrost_mnesia:broadcast_config_reload(campaign_blocks),
+    case Result of
+        ok -> <<"published">>;
+        {error, _} -> <<"saved_not_distributed">>
+    end.
 
 %% $1 tld, $2 leading_label (marker), $3 client, $4 days, $5 kind, $6 parent.
 dismiss(#{kind := Kind, tld := Tld, leading_label := Label, parent := Parent,

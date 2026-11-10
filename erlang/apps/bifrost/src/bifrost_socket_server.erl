@@ -135,6 +135,9 @@ handle_inbound(Data, ConnId) ->
 dispatch(#{<<"type">> := Type} = Ack, ConnId)
   when Type =:= <<"dns_settings_applied">>; Type =:= <<"dns_settings_rejected">> ->
     bifrost_dns_settings_server:handle_ack(ConnId, Ack);
+dispatch(#{<<"type">> := Type} = Ack, ConnId)
+  when Type =:= <<"campaign_blocks_applied">>; Type =:= <<"campaign_blocks_rejected">> ->
+    bifrost_campaign_policy:handle_ack(ConnId, Ack);
 dispatch(#{<<"type">> := <<"cache_store">>} = CacheStore, _ConnId) ->
     try bifrost_mnesia:write_cache_entry(CacheStore)
     catch C:R -> logger:debug("cache propagation write failed: ~p:~p", [C, R])

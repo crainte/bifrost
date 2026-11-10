@@ -1,0 +1,25 @@
+{
+  "_comment": "Shared by rust/src/campaign_blocks.rs (DNS enforcement) and bifrost_campaign_block_SUITE (SQL match_sql). One table, so the two matchers cannot drift apart. A rule is {kind, parent|tld+leading_label}; each case lists names the rule must / must not match.",
+  "cases": [
+    {
+      "rule": {"kind": "family", "parent": "stg.example.com", "tld": "com"},
+      "match": ["3.stg.example.com", "3x.stg.example.com", "0.stg.example.com", "447xx.stg.example.com", "3.STG.Example.COM", "3.stg.example.com."],
+      "no_match": ["abc.stg.example.com", "3a.stg.example.com", "3.other.example.com", "stg.example.com", "3.stg.example.com.evil", "3.x.stg.example.com", "33.stg.example.org", "x3.stg.example.com", ".stg.example.com", "x.3.stg.example.com"]
+    },
+    {
+      "rule": {"kind": "marker", "tld": "site", "leading_label": "447"},
+      "match": ["447.alpha.site", "447.sub.alpha.site", "447.ALPHA.Site.", "447.a.b.c.site"],
+      "no_match": ["447.site", "447.alpha.com", "447x.alpha.site", "4470.alpha.site", "44.alpha.site", "alpha.447.site", "447.alpha.site.evil", "447.alpha.mysite", "x447.alpha.site"]
+    },
+    {
+      "rule": {"kind": "marker", "tld": "com", "leading_label": "12x"},
+      "match": ["12x.foo.com", "12x.a.b.com"],
+      "no_match": ["12.foo.com", "12xx.foo.com", "12x.com"]
+    },
+    {
+      "rule": {"kind": "family", "parent": "a.co.uk", "tld": "uk"},
+      "match": ["1.a.co.uk"],
+      "no_match": ["1.b.co.uk", "1.co.uk", "1.a.co.uk.x"]
+    }
+  ]
+}

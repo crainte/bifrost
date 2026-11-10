@@ -2,6 +2,7 @@ mod acl;
 mod allowlist;
 mod blocklist;
 mod cache;
+mod campaign_blocks;
 mod client_blocks;
 mod events;
 mod forwarder;
@@ -34,6 +35,9 @@ pub struct AppState {
     pub blocklist: Blocklist,
     pub allowlist: allowlist::Allowlist,
     pub client_blocks: client_blocks::ClientBlocks,
+    /// Explicit campaign-pattern blocks, replaced whole by `apply_campaign_blocks`.
+    pub campaign_blocks: campaign_blocks::CampaignBlocks,
+    pub campaign_revision: u64,
     pub cache: Cache,
     /// Behind an Arc so the hot path can clone it out of the state lock and
     /// await the network without holding the lock.
@@ -61,6 +65,8 @@ impl AppState {
             rewrites: rewrites::Rewrites::new(),
             allowlist: allowlist::Allowlist::new(),
             client_blocks: client_blocks::ClientBlocks::new(),
+            campaign_blocks: campaign_blocks::CampaignBlocks::new(),
+            campaign_revision: 0,
             cache: Cache::new(100000),
             forwarder: Arc::new(Forwarder::new()),
             routing: None,

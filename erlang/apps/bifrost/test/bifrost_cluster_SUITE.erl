@@ -42,7 +42,13 @@
          pause_is_reapplied_when_a_peer_rehydrates/1,
          timed_pause_expires_on_every_node/1,
          dns_settings_publish_applies_on_peer_rust/1,
-         stale_dns_settings_are_not_published_or_applied/1]).
+         stale_dns_settings_are_not_published_or_applied/1,
+         campaign_blocks_publish_and_apply_on_peer_rust/1,
+         campaign_status_is_applied_only_after_every_node_acks/1,
+         campaign_missing_seed_cannot_look_fully_applied/1,
+         stale_campaign_blocks_are_not_published_or_applied/1,
+         campaign_revocation_reaches_peer_rust/1,
+         campaign_blocks_are_resent_before_reload_complete/1]).
 
 %% spawned on the peer nodes, so they must be exported
 -export([fake_rust_loop/1, lock_holder/2, leader_probe/3]).
@@ -74,7 +80,13 @@ all() ->
      pause_is_reapplied_when_a_peer_rehydrates,
      timed_pause_expires_on_every_node,
      dns_settings_publish_applies_on_peer_rust,
-     stale_dns_settings_are_not_published_or_applied].
+     stale_dns_settings_are_not_published_or_applied,
+     campaign_blocks_publish_and_apply_on_peer_rust,
+     campaign_status_is_applied_only_after_every_node_acks,
+     campaign_missing_seed_cannot_look_fully_applied,
+     stale_campaign_blocks_are_not_published_or_applied,
+     campaign_revocation_reaches_peer_rust,
+     campaign_blocks_are_resent_before_reload_complete].
 
 %% ── Suite setup ───────────────────────────────────────────────
 
@@ -739,6 +751,187 @@ stale_dns_settings_are_not_published_or_applied(Config) ->
         end
     end).
 
+%% ── Campaign blocks across two nodes ─────────────────────────
+%%
+%% The distributed contract: a rule published on A must reach B's OWN Rust (not
+%% just B's Mnesia), B must report it applied only after Rust acks, and a stale
+%% revision must neither publish nor reach Rust.
+%%
+%% MUTATION CHECK (how to prove these assert something): in
+%% bifrost_campaign_policy:adopt/2 replace the send_current/2 call with just the
+%% state update (the "missing push"). campaign_blocks_publish_and_apply_on_peer_rust,
+%% campaign_revocation_reaches_peer_rust and
+%% campaign_status_is_applied_only_after_every_node_acks must then fail, because
+%% B's Rust never receives the message.
+
+campaign_rule(Id, Parent) ->
+    #{id => Id, kind => <<"family">>, parent => Parent, tld => <<"com">>,
+      leading_label => null, client_ip => null}.
+
+is_campaign_msg(Revision) ->
+    fun(#{type := <<"apply_campaign_blocks">>, revision := R}) -> R =:= Revision;
+       (_) -> false end.
+
+%% Accumulates across polls (collect_rust_msgs/1 drains), returning everything
+%% seen once Pred holds for one message.
+await_rust_msg(Pred) ->
+    await_rust_msg(Pred, [], ?WAIT).
+
+await_rust_msg(_Pred, Seen, Left) when Left =< 0 ->
+    ct:fail({rust_message_never_arrived, Seen});
+await_rust_msg(Pred, Seen, Left) ->
+    All = Seen ++ collect_rust_msgs(200),
+    case lists:any(Pred, All) of
+        true -> All;
+        false -> await_rust_msg(Pred, All, Left - 300)
+    end.
+
+campaign_blocks_publish_and_apply_on_peer_rust(Config) ->
+    [A, B] = ?config(nodes, Config),
+    with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        Fake = start_fake_rust(B),
+        try
+            Snapshot = #{revision => 7001,
+                         rules => [campaign_rule(41, <<"stg.example.com">>)]},
+            ok = erpc:call(A, bifrost_campaign_policy, publish, [Snapshot]),
+            Msgs = await_rust_msg(is_campaign_msg(7001)),
+            [Msg | _] = [M || M <- Msgs, (is_campaign_msg(7001))(M)],
+            ?assertMatch([#{id := 41, kind := <<"family">>, parent := <<"stg.example.com">>,
+                            client_ip := null}], maps:get(rules, Msg)),
+            ok = wait_until(fun() ->
+                maps:get(applied_revision, erpc:call(B, bifrost_campaign_policy, status, [])) =:= 7001
+            end)
+        after
+            stop_fake_rust(B, Fake)
+        end
+    end).
+
+%% The page may only say "enforced" when EVERY node's Rust has acknowledged the
+%% rule's revision. B applied; A has no Rust yet; the rule must stay `applying`
+%% until A's Rust acks too.
+campaign_status_is_applied_only_after_every_node_acks(Config) ->
+    [A, B] = ?config(nodes, Config),
+    with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        FakeB = start_fake_rust(B),
+        try
+            ok = erpc:call(A, bifrost_campaign_policy, publish,
+                           [#{revision => 7050, rules => [campaign_rule(42, <<"stg.example.net">>)]}]),
+            ok = wait_until(fun() ->
+                maps:get(applied_revision, erpc:call(B, bifrost_campaign_policy, status, [])) =:= 7050
+            end),
+            Statuses = erpc:call(A, bifrost_campaign_policy, cluster_status, []),
+            ?assertEqual(applying, bifrost_campaign_policy:rule_state(7050, Statuses)),
+            FakeA = start_fake_rust(A),
+            try
+                %% A's Rust connects (re-hydration): the full set is pushed and acked.
+                ok = erpc:call(A, bifrost_campaign_policy, apply_current, [], 15000),
+                ok = wait_until(fun() ->
+                    bifrost_campaign_policy:rule_state(7050,
+                        erpc:call(A, bifrost_campaign_policy, cluster_status, [])) =:= applied
+                end)
+            after
+                stop_fake_rust(A, FakeA)
+            end
+        after
+            stop_fake_rust(B, FakeB)
+        end
+    end).
+
+campaign_missing_seed_cannot_look_fully_applied(Config) ->
+    [A, B] = ?config(nodes, Config),
+    with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        Missing = 'campaign_missing@localhost',
+        true = erpc:call(A, os, putenv,
+                         ["BIFROST_CLUSTER_NODES", atom_to_list(Missing)]),
+        try
+            Statuses = erpc:call(A, bifrost_campaign_policy, cluster_status, []),
+            ?assert(lists:member(B, erpc:call(A, mnesia, system_info, [db_nodes]))),
+            ?assertMatch([#{state := <<"offline">>}],
+                [S || #{node := N} = S <- Statuses, N =:= Missing]),
+            ?assertEqual(applying, bifrost_campaign_policy:rule_state(1, Statuses))
+        after
+            erpc:call(A, os, unsetenv, ["BIFROST_CLUSTER_NODES"])
+        end
+    end).
+
+stale_campaign_blocks_are_not_published_or_applied(Config) ->
+    [A, B] = ?config(nodes, Config),
+    with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        ok = erpc:call(A, bifrost_campaign_policy, publish,
+                       [#{revision => 7100, rules => [campaign_rule(43, <<"stg.example.org">>)]}]),
+        ok = wait_until(fun() ->
+            maps:get(desired_revision, erpc:call(B, bifrost_campaign_policy, status, [])) =:= 7100
+        end),
+        Fake = start_fake_rust(B),
+        try
+            ?assertEqual({error, stale},
+                         erpc:call(A, bifrost_campaign_policy, publish,
+                                   [#{revision => 7050, rules => []}])),
+            ?assertEqual({error, stale},
+                         erpc:call(A, bifrost_campaign_policy, publish,
+                                   [#{revision => 7100, rules => []}])),
+            ?assertEqual([], [M || #{type := <<"apply_campaign_blocks">>} = M <- collect_rust_msgs(700)]),
+            ?assertEqual(7100, maps:get(desired_revision,
+                erpc:call(B, bifrost_campaign_policy, status, [])))
+        after
+            stop_fake_rust(B, Fake)
+        end
+    end).
+
+%% Revoke is a NEWER revision carrying the full (now smaller) set; it must reach
+%% the peer's Rust, or the peer keeps blocking a revoked pattern.
+campaign_revocation_reaches_peer_rust(Config) ->
+    [A, B] = ?config(nodes, Config),
+    with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        Fake = start_fake_rust(B),
+        try
+            ok = erpc:call(A, bifrost_campaign_policy, publish,
+                           [#{revision => 7200, rules => [campaign_rule(44, <<"stg.example.io">>)]}]),
+            _ = await_rust_msg(is_campaign_msg(7200)),
+            ok = erpc:call(A, bifrost_campaign_policy, publish, [#{revision => 7201, rules => []}]),
+            Msgs = await_rust_msg(is_campaign_msg(7201)),
+            [Last | _] = lists:reverse([M || #{type := <<"apply_campaign_blocks">>} = M <- Msgs]),
+            ?assertEqual(7201, maps:get(revision, Last)),
+            ?assertEqual([], maps:get(rules, Last))
+        after
+            stop_fake_rust(B, Fake)
+        end
+    end).
+
+%% A Rust that (re)connects is empty: hydration must push the current rule set
+%% and get it acknowledged BEFORE reload_complete, or a restarted pod would
+%% serve DNS without the campaign blocks.
+campaign_blocks_are_resent_before_reload_complete(Config) ->
+    [A, B] = ?config(nodes, Config),
+    with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        ok = erpc:call(A, bifrost_campaign_policy, publish,
+                       [#{revision => 7300, rules => [campaign_rule(45, <<"stg.example.dev">>)]}]),
+        ok = wait_until(fun() ->
+            maps:get(desired_revision, erpc:call(B, bifrost_campaign_policy, status, [])) =:= 7300
+        end),
+        Fake = start_manager(B, self()),
+        try
+            flush_rust_msgs(),
+            ok = erpc:call(B, bifrost_blocklist_manager, on_client_connected, []),
+            Msgs = await_rust_msg(fun(#{type := T}) -> T =:= <<"reload_complete">>;
+                                     (_) -> false end),
+            Types = [maps:get(type, M) || M <- Msgs],
+            Campaign = index_of(<<"apply_campaign_blocks">>, Types),
+            Complete = index_of(<<"reload_complete">>, Types),
+            ?assert(Campaign > 0),
+            ?assert(Campaign < Complete)
+        after
+            stop_manager(B, Fake)
+        end
+    end).
+
+index_of(Item, List) ->
+    case [I || {I, X} <- lists:zip(lists:seq(1, length(List)), List), X =:= Item] of
+        [I | _] -> I;
+        [] -> 0
+    end.
+
+
 with_settings_servers(Nodes, PrivDir, Fun) ->
     Path = filename:join(PrivDir, "dns_settings_config.erl"),
     ok = file:write_file(Path, <<"{upstreams, [[{address, \"192.0.2.53\"}, {port, 53}]]}.\n">>),
@@ -747,8 +940,12 @@ with_settings_servers(Nodes, PrivDir, Fun) ->
         [{ok, _} = erpc:call(N, gen_server, start,
              [{local, bifrost_dns_settings_server}, bifrost_dns_settings_server, [], []])
          || N <- Nodes],
+        [{ok, _} = erpc:call(N, gen_server, start,
+             [{local, bifrost_campaign_policy}, bifrost_campaign_policy, [], []])
+         || N <- Nodes],
         try Fun()
         after
+            [catch erpc:call(N, gen_server, stop, [bifrost_campaign_policy]) || N <- Nodes],
             [catch erpc:call(N, gen_server, stop, [bifrost_dns_settings_server]) || N <- Nodes]
         end
     end).
@@ -788,6 +985,9 @@ fake_rust_loop(Collector) ->
                     bifrost_dns_settings_server:handle_ack(fake_connection,
                         #{<<"type">> => <<"dns_settings_applied">>, <<"revision">> => R,
                           <<"fingerprint">> => F});
+                #{type := <<"apply_campaign_blocks">>, revision := R} ->
+                    bifrost_campaign_policy:handle_ack(fake_connection,
+                        #{<<"type">> => <<"campaign_blocks_applied">>, <<"revision">> => R});
                 _ -> ok
             end,
             fake_rust_loop(Collector);

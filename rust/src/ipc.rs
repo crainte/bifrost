@@ -77,6 +77,9 @@ async fn read_loop(
             Ok(msg) if msg["type"] == "apply_dns_settings" => {
                 apply_settings(msg, state, ack_tx).await
             }
+            Ok(msg) if msg["type"] == "apply_campaign_blocks" => {
+                apply_campaign_blocks(msg, state, ack_tx).await
+            }
             Ok(msg) => handle_control_message(msg, ready_tx, state).await,
             Err(e) => warn!(%e, "skipping malformed IPC frame"),
         }
@@ -155,6 +158,54 @@ async fn apply_settings(
     };
     if ack_tx.send(message).await.is_err() {
         warn!(revision, "settings acknowledgement channel closed");
+    }
+}
+
+/// Campaign block policy is the second acknowledged message (after DNS
+/// settings): a saved rule is only "applied" once this returns
+/// `campaign_blocks_applied` for its revision. The set is compiled off to the
+/// side and swapped in whole; an invalid rule or a revision older than the one
+/// already applied is rejected and leaves the live set untouched. The same
+/// revision is accepted again so a reconnect re-hydration is idempotent.
+async fn apply_campaign_blocks(
+    msg: serde_json::Value,
+    state: &Arc<RwLock<AppState>>,
+    ack_tx: &mpsc::Sender<serde_json::Value>,
+) {
+    let revision = msg["revision"].as_u64();
+    let compiled = match (revision, msg["rules"].as_array()) {
+        (Some(_), Some(rules)) => rules
+            .iter()
+            .map(crate::campaign_blocks::rule_from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(crate::campaign_blocks::CampaignBlocks::compile),
+        _ => Err("missing campaign policy revision or rules".to_string()),
+    };
+    let revision = revision.unwrap_or(0);
+    let reply = match compiled {
+        Ok(set) => {
+            let mut s = state.write().await;
+            if revision < s.campaign_revision {
+                Err("stale campaign policy revision".to_string())
+            } else {
+                info!(revision, rules = set.len(), "applied campaign blocks");
+                s.campaign_blocks = set;
+                s.campaign_revision = revision;
+                Ok(())
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let message = match reply {
+        Ok(()) => serde_json::json!({"type":"campaign_blocks_applied","revision":revision}),
+        Err(e) => {
+            warn!(revision, error = %e, "rejected campaign blocks");
+            serde_json::json!({"type":"campaign_blocks_rejected","revision":revision,
+                "error":e.chars().take(240).collect::<String>()})
+        }
+    };
+    if ack_tx.send(message).await.is_err() {
+        warn!(revision, "campaign acknowledgement channel closed");
     }
 }
 
@@ -475,6 +526,107 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(1500), l.accept())
             .await
             .is_err()
+    }
+
+    fn campaign_msg(revision: u64, rules: serde_json::Value) -> String {
+        serde_json::json!({"type": "apply_campaign_blocks", "revision": revision,
+                           "rules": rules})
+        .to_string()
+    }
+
+    fn fam(id: i64, parent: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "kind": "family", "parent": parent, "tld": "com",
+                           "leading_label": null, "client_ip": null})
+    }
+
+    async fn push_campaign(conn: &mut UnixStream, revision: u64, rules: serde_json::Value) {
+        send_frame(conn, &campaign_msg(revision, rules)).await;
+    }
+
+    async fn reply(conn: &mut UnixStream) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(2), read_frame(conn))
+            .await
+            .expect("no acknowledgement")
+    }
+
+    #[tokio::test]
+    async fn campaign_blocks_are_applied_and_acknowledged_by_revision() {
+        let h = start("campaign-ack");
+        let mut conn = accept(&h.listener).await;
+        push_campaign(&mut conn, 5, serde_json::json!([fam(1, "stg.example.com")])).await;
+        let ack = reply(&mut conn).await;
+        assert_eq!(ack["type"], "campaign_blocks_applied");
+        assert_eq!(ack["revision"], 5);
+        let s = h.state.read().await;
+        assert_eq!(s.campaign_revision, 5);
+        assert_eq!(
+            s.campaign_blocks
+                .matches("10.0.0.1".parse().unwrap(), "9.stg.example.com"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_campaign_revision_is_rejected_and_changes_nothing() {
+        let h = start("campaign-stale");
+        let mut conn = accept(&h.listener).await;
+        push_campaign(&mut conn, 5, serde_json::json!([fam(1, "stg.example.com")])).await;
+        let _ = reply(&mut conn).await;
+        push_campaign(&mut conn, 4, serde_json::json!([])).await;
+        let nack = reply(&mut conn).await;
+        assert_eq!(nack["type"], "campaign_blocks_rejected");
+        assert_eq!(nack["revision"], 4);
+        let s = h.state.read().await;
+        assert_eq!(s.campaign_revision, 5);
+        assert_eq!(
+            s.campaign_blocks.len(),
+            1,
+            "stale push must not empty the set"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_campaign_rule_rejects_the_whole_push() {
+        let h = start("campaign-invalid");
+        let mut conn = accept(&h.listener).await;
+        push_campaign(&mut conn, 5, serde_json::json!([fam(1, "stg.example.com")])).await;
+        let _ = reply(&mut conn).await;
+        push_campaign(
+            &mut conn,
+            6,
+            serde_json::json!([fam(1, "stg.example.com"), fam(2, "com")]),
+        )
+        .await;
+        let nack = reply(&mut conn).await;
+        assert_eq!(nack["type"], "campaign_blocks_rejected");
+        let s = h.state.read().await;
+        assert_eq!(
+            s.campaign_revision, 5,
+            "a rejected push keeps the old revision"
+        );
+        assert_eq!(s.campaign_blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn campaign_blocks_resend_at_same_revision_is_idempotent() {
+        let h = start("campaign-same");
+        let mut conn = accept(&h.listener).await;
+        for _ in 0..2 {
+            push_campaign(&mut conn, 5, serde_json::json!([fam(1, "stg.example.com")])).await;
+            assert_eq!(reply(&mut conn).await["type"], "campaign_blocks_applied");
+        }
+        assert_eq!(h.state.read().await.campaign_blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revocation_is_a_newer_empty_revision() {
+        let h = start("campaign-revoke");
+        let mut conn = accept(&h.listener).await;
+        push_campaign(&mut conn, 5, serde_json::json!([fam(1, "stg.example.com")])).await;
+        let _ = reply(&mut conn).await;
+        push_campaign(&mut conn, 6, serde_json::json!([])).await;
+        assert_eq!(reply(&mut conn).await["type"], "campaign_blocks_applied");
+        assert_eq!(h.state.read().await.campaign_blocks.len(), 0);
     }
 
     #[tokio::test]

@@ -20,7 +20,11 @@
          pushes_fall_back_to_last_known_config_when_db_is_down/1,
          hydration_completes_from_snapshot_when_db_is_down/1,
          hydration_completes_when_db_hangs/1,
-         rejected_settings_block_reload_complete/1]).
+         rejected_settings_block_reload_complete/1,
+         campaign_blocks_hydrate_from_postgres_before_reload_complete/1,
+         campaign_blocks_hydrate_from_snapshot_when_db_is_down/1,
+         hydration_fails_closed_without_any_campaign_policy/1,
+         rejected_campaign_blocks_block_reload_complete/1]).
 -export([fake_rust/1]).
 
 -define(PORT, 18124).
@@ -32,7 +36,11 @@ all() ->
      pushes_fall_back_to_last_known_config_when_db_is_down,
      hydration_completes_from_snapshot_when_db_is_down,
      hydration_completes_when_db_hangs,
-     rejected_settings_block_reload_complete].
+     rejected_settings_block_reload_complete,
+     campaign_blocks_hydrate_from_postgres_before_reload_complete,
+     campaign_blocks_hydrate_from_snapshot_when_db_is_down,
+     hydration_fails_closed_without_any_campaign_policy,
+     rejected_campaign_blocks_block_reload_complete].
 
 init_per_suite(Config) ->
     [{ok, _} = application:ensure_all_started(A) || A <- [crypto, epgsql, cowboy, inets]],
@@ -81,6 +89,7 @@ init_per_testcase(_TC, Config) ->
 
 end_per_testcase(_TC, Config) ->
     stop(bifrost_blocklist_manager),
+    stop(bifrost_campaign_policy),
     stop(bifrost_dns_settings_server),
     exit(?config(fake, Config), kill),
     catch unregister(bifrost_socket_server),
@@ -99,6 +108,59 @@ rejected_settings_block_reload_complete(Config) ->
     hydrate(),
     Msgs = collect(3000),
     ?assert(lists:any(fun(#{type := T}) -> T =:= <<"apply_dns_settings">>; (_) -> false end, Msgs)),
+    ?assertNot(lists:member(#{type => <<"reload_complete">>}, Msgs)),
+    ?assertNot(bifrost_blocklist_manager:is_hydrated()).
+
+%% Campaign blocks are policy: a node must not serve DNS until its Rust has
+%% ACKNOWLEDGED the current rule set, and the set is pushed on every connect.
+campaign_blocks_hydrate_from_postgres_before_reload_complete(_Config) ->
+    {created, #{id := Id}} = activate(<<"hyd.example.com">>),
+    hydrate(),
+    Msgs = collect(),
+    Types = [maps:get(type, M) || M <- Msgs],
+    ?assert(lists:member(<<"apply_campaign_blocks">>, Types)),
+    ?assertEqual(<<"reload_complete">>, lists:last(Types)),
+    [Push | _] = campaign_msgs(Msgs),
+    ?assert(lists:any(fun(#{id := I, parent := P}) -> I =:= Id andalso P =:= <<"hyd.example.com">> end,
+                      maps:get(rules, Push))),
+    ?assertMatch(#{state := <<"applied">>}, bifrost_campaign_policy:status()).
+
+%% "On DB outage use the last-known Mnesia snapshot": a NEW policy process (a
+%% restarted pod) with Postgres down still hydrates the same rules.
+campaign_blocks_hydrate_from_snapshot_when_db_is_down(_Config) ->
+    {created, #{id := Id}} = activate(<<"snap.example.com">>),
+    hydrate(),
+    Live = collect(),
+    ?assertMatch({ok, #{rules := [_ | _]}}, bifrost_opconfig:snapshot(campaign_blocks)),
+    stop(bifrost_campaign_policy),
+    stop(bifrost_db_pool),
+    hydrate(),
+    NoDb = collect(),
+    ?assert(lists:member(#{type => <<"reload_complete">>}, NoDb)),
+    [Push | _] = campaign_msgs(NoDb),
+    ?assert(lists:any(fun(#{id := I}) -> I =:= Id end, maps:get(rules, Push))),
+    ?assertEqual(maps:get(revision, hd(campaign_msgs(Live))), maps:get(revision, Push)).
+
+%% Fail closed: neither Postgres nor a snapshot can say what the policy is, so an
+%% empty set must NOT be assumed. No reload_complete, node stays unready.
+hydration_fails_closed_without_any_campaign_policy(_Config) ->
+    stop(bifrost_campaign_policy),
+    ok = mnesia:dirty_delete(opconfig, campaign_blocks),
+    stop(bifrost_db_pool),
+    hydrate(),
+    Msgs = collect(3000),
+    ?assertNot(lists:member(#{type => <<"reload_complete">>}, Msgs)),
+    ?assertEqual([], campaign_msgs(Msgs)),
+    ?assertNot(bifrost_blocklist_manager:is_hydrated()).
+
+rejected_campaign_blocks_block_reload_complete(Config) ->
+    exit(?config(fake, Config), kill),
+    catch unregister(bifrost_socket_server),
+    Fake = spawn(?MODULE, fake_rust, [{reject_campaign, self()}]),
+    register(bifrost_socket_server, Fake),
+    hydrate(),
+    Msgs = collect(3000),
+    ?assertNotEqual([], campaign_msgs(Msgs)),
     ?assertNot(lists:member(#{type => <<"reload_complete">>}, Msgs)),
     ?assertNot(bifrost_blocklist_manager:is_hydrated()).
 
@@ -171,7 +233,20 @@ push_all() ->
     bifrost_api_handler:push_manual_blocks(),
     bifrost_api_handler:push_client_blocks().
 
+activate(Parent) ->
+    bifrost_campaign_block_store:activate(
+      #{kind => family, parent => Parent, leading_label => null, tld => <<"com">>,
+        client_ip => null, observed_domains => 3}).
+
+campaign_msgs(Msgs) ->
+    [M || #{type := <<"apply_campaign_blocks">>} = M <- Msgs].
+
 hydrate() ->
+    case whereis(bifrost_campaign_policy) of
+        undefined -> {ok, _} = gen_server:start({local, bifrost_campaign_policy},
+                                                bifrost_campaign_policy, [], []);
+        _ -> ok
+    end,
     case whereis(bifrost_dns_settings_server) of
         undefined -> {ok, _} = gen_server:start({local, bifrost_dns_settings_server},
                                                 bifrost_dns_settings_server, [], []);
@@ -186,6 +261,27 @@ hydrate() ->
     end,
     bifrost_blocklist_manager:on_client_connected().
 
+fake_rust({reject_campaign, Collector}) ->
+    receive
+        {'$gen_call', From, {send, Data}} ->
+            Collector ! {rust_msg, Data},
+            gen_server:reply(From, ok),
+            case Data of
+                #{type := <<"apply_dns_settings">>, revision := R, fingerprint := F} ->
+                    bifrost_dns_settings_server:handle_ack(fake_connection,
+                        #{<<"type">> => <<"dns_settings_applied">>,
+                          <<"revision">> => R, <<"fingerprint">> => F});
+                #{type := <<"apply_campaign_blocks">>, revision := R} ->
+                    bifrost_campaign_policy:handle_ack(fake_connection,
+                        #{<<"type">> => <<"campaign_blocks_rejected">>, <<"revision">> => R,
+                          <<"error">> => <<"test rejection">>});
+                _ -> ok
+            end,
+            fake_rust({reject_campaign, Collector});
+        {'$gen_call', From, connection_id} ->
+            gen_server:reply(From, fake_connection),
+            fake_rust({reject_campaign, Collector})
+    end;
 fake_rust({reject, Collector}) ->
     receive
         {'$gen_call', From, {send, Data}} ->
@@ -196,6 +292,9 @@ fake_rust({reject, Collector}) ->
                     bifrost_dns_settings_server:handle_ack(fake_connection,
                         #{<<"type">> => <<"dns_settings_rejected">>, <<"revision">> => R,
                           <<"fingerprint">> => F, <<"error">> => <<"test rejection">>});
+                #{type := <<"apply_campaign_blocks">>, revision := R} ->
+                    bifrost_campaign_policy:handle_ack(fake_connection,
+                        #{<<"type">> => <<"campaign_blocks_applied">>, <<"revision">> => R});
                 _ -> ok
             end,
             fake_rust({reject, Collector});
@@ -213,6 +312,9 @@ fake_rust(Collector) ->
                     bifrost_dns_settings_server:handle_ack(fake_connection,
                         #{<<"type">> => <<"dns_settings_applied">>,
                           <<"revision">> => R, <<"fingerprint">> => F});
+                #{type := <<"apply_campaign_blocks">>, revision := R} ->
+                    bifrost_campaign_policy:handle_ack(fake_connection,
+                        #{<<"type">> => <<"campaign_blocks_applied">>, <<"revision">> => R});
                 _ -> ok
             end,
             fake_rust(Collector);

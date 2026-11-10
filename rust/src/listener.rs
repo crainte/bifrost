@@ -328,15 +328,21 @@ async fn handle_query(
             }
             debug!(client=%src.ip(), domain=%domain_trimmed, qtype, "allowlisted, bypassing block");
         } else {
-            // Per-client block takes precedence, then global blocklist. Both
-            // produce a BIFROST_BLOCK; list_id distinguishes the source.
+            // Per-client block takes precedence, then global blocklist, then
+            // campaign-pattern rules (which also cover names never seen
+            // before). All produce a BIFROST_BLOCK; list_id distinguishes the
+            // source (`campaign:<rule id>` for a campaign rule). This runs
+            // before the cache lookup, so a clean answer cached earlier cannot
+            // bypass a rule.
             let block_reason: Option<String> = if s.client_blocks.contains(src.ip(), domain_trimmed)
             {
                 Some(format!("client:{}", src.ip()))
+            } else if let Some(id) = s.blocklist.contains(domain_trimmed) {
+                Some(id.to_string())
             } else {
-                s.blocklist
-                    .contains(domain_trimmed)
-                    .map(|id| id.to_string())
+                s.campaign_blocks
+                    .matches(src.ip(), domain_trimmed)
+                    .map(|id| format!("campaign:{id}"))
             };
             if let Some(list_id) = block_reason {
                 let response = build_blocked_response(&request, mode)?;
@@ -2073,6 +2079,210 @@ mod tests {
         .await;
         let resp = Message::from_bytes(&bytes).unwrap();
         assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    // ── Campaign blocks (spec: threat-campaign-blocking) ──
+
+    use crate::campaign_blocks::{CampaignBlocks, Rule, Shape};
+
+    fn family_rule(id: i64, parent: &str, client: Option<&str>) -> Rule {
+        Rule {
+            id,
+            shape: Shape::Family {
+                parent: parent.into(),
+            },
+            client: client.map(|c| c.parse().unwrap()),
+        }
+    }
+
+    async fn with_campaign(rules: Vec<Rule>) -> Arc<RwLock<AppState>> {
+        let st = test_state();
+        st.write().await.campaign_blocks = CampaignBlocks::compile(rules).unwrap();
+        st
+    }
+
+    /// Ask as `client`, returning the response and every event emitted.
+    async fn ask_as(
+        st: &Arc<RwLock<AppState>>,
+        client: &str,
+        name: &str,
+        protection: bool,
+    ) -> (Message, Vec<String>) {
+        let (tx, mut rx) = mpsc::channel(16);
+        let src: SocketAddr = format!("{client}:5000").parse().unwrap();
+        let bytes = handle_query(
+            src,
+            &query(name, RecordType::A).to_bytes().unwrap(),
+            st,
+            &tx,
+            &BlockMode::ZeroIp,
+            protection,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(m) = rx.recv().await {
+            if let WriterMessage::Event(e) = m {
+                events.push(String::from_utf8(e.to_json().unwrap()).unwrap());
+            }
+        }
+        (Message::from_bytes(&bytes).unwrap(), events)
+    }
+
+    #[tokio::test]
+    async fn campaign_blocks_a_never_seen_name_and_attributes_it() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        let (resp, events) = ask_as(&st, "192.168.1.42", "98765.stg.example.com.", true).await;
+        assert!(is_zero_ip_block(&resp));
+        assert!(resp.edns.is_some(), "EDE 15 is attached");
+        let json = events.first().expect("one event");
+        assert!(json.contains("BIFROST_BLOCK"), "{json}");
+        assert!(json.contains("\"list_id\":\"campaign:7\""), "{json}");
+        assert!(json.contains("\"ede_code\":15"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn campaign_does_not_block_lookalikes() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        for name in [
+            "abc.stg.example.com.",
+            "stg.example.com.",
+            "3.other.example.com.",
+        ] {
+            let (resp, _) = ask_as(&st, "192.168.1.42", name, true).await;
+            assert!(
+                !is_zero_ip_block(&resp),
+                "{name} must not be campaign-blocked"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allowlist_beats_campaign_block() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        st.write()
+            .await
+            .allowlist
+            .load(vec!["3.stg.example.com".into()]);
+        let (resp, events) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", true).await;
+        assert!(!is_zero_ip_block(&resp));
+        assert!(!events.iter().any(|e| e.contains("campaign:")));
+    }
+
+    #[tokio::test]
+    async fn paused_protection_beats_campaign_block() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        let (resp, _) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", false).await;
+        assert!(!is_zero_ip_block(&resp));
+    }
+
+    #[tokio::test]
+    async fn client_scoped_campaign_blocks_only_that_client() {
+        let st = with_campaign(vec![family_rule(
+            7,
+            "stg.example.com",
+            Some("192.168.1.42"),
+        )])
+        .await;
+        let (a, _) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", true).await;
+        let (b, _) = ask_as(&st, "192.168.1.43", "3.stg.example.com.", true).await;
+        assert!(is_zero_ip_block(&a));
+        assert!(!is_zero_ip_block(&b));
+    }
+
+    #[tokio::test]
+    async fn campaign_is_checked_before_the_cache() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        {
+            // A clean answer cached before the rule existed.
+            let mut cached =
+                Message::new(1, MessageType::Response, hickory_proto::op::OpCode::Query);
+            cached.add_queries(query("3.stg.example.com.", RecordType::A).queries.to_vec());
+            st.write().await.cache.insert(
+                "3.stg.example.com:1".into(),
+                cached.to_bytes().unwrap(),
+                300,
+            );
+        }
+        let (resp, _) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", true).await;
+        assert!(is_zero_ip_block(&resp));
+    }
+
+    #[tokio::test]
+    async fn replacing_the_rule_set_revokes_the_block() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        let (blocked, _) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", true).await;
+        assert!(is_zero_ip_block(&blocked));
+        st.write().await.campaign_blocks = CampaignBlocks::compile(vec![]).unwrap();
+        let (open, _) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", true).await;
+        assert!(!is_zero_ip_block(&open));
+    }
+
+    #[tokio::test]
+    async fn existing_exact_blocks_survive_campaign_revocation() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", None)]).await;
+        st.write()
+            .await
+            .blocklist
+            .load("manual", vec!["3.stg.example.com".into()]);
+        st.write().await.campaign_blocks = CampaignBlocks::compile(vec![]).unwrap();
+        let (resp, events) = ask_as(&st, "192.168.1.42", "3.stg.example.com.", true).await;
+        assert!(is_zero_ip_block(&resp));
+        assert!(
+            events[0].contains("\"list_id\":\"manual\""),
+            "{}",
+            events[0]
+        );
+    }
+
+    /// Real UDP sockets end to end: a client-scoped rule for 127.0.0.2 blocks a
+    /// never-seen name for that client only, an allowlisted name passes, and
+    /// replacing the rule set (revoke) takes effect on the next query.
+    #[tokio::test]
+    async fn udp_campaign_block_scope_allowlist_and_revoke() {
+        let st = with_campaign(vec![family_rule(7, "stg.example.com", Some("127.0.0.2"))]).await;
+        {
+            let mut s = st.write().await;
+            s.ready = true;
+            s.block_mode = BlockMode::ZeroIp;
+            s.allowlist.load(vec!["5.stg.example.com".into()]);
+        }
+        let server_port = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        tokio::spawn(run_udp(st.clone(), tx, addr));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        async fn ask(client: &str, addr: SocketAddr, name: &str) -> Message {
+            let sock = UdpSocket::bind(format!("{client}:0")).await.unwrap();
+            let q = query(name, RecordType::A).to_bytes().unwrap();
+            sock.send_to(&q, addr).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv_from(&mut buf))
+                    .await
+                    .expect("no UDP response")
+                    .unwrap();
+            Message::from_bytes(&buf[..n]).unwrap()
+        }
+
+        let a = ask("127.0.0.2", addr, "98765.stg.example.com.").await;
+        assert!(
+            is_zero_ip_block(&a),
+            "scoped client is blocked on a new name"
+        );
+        let b = ask("127.0.0.3", addr, "98765.stg.example.com.").await;
+        assert!(!is_zero_ip_block(&b), "other clients are not");
+        let allowed = ask("127.0.0.2", addr, "5.stg.example.com.").await;
+        assert!(!is_zero_ip_block(&allowed), "allowlist wins");
+
+        st.write().await.campaign_blocks = CampaignBlocks::compile(vec![]).unwrap();
+        let after = ask("127.0.0.2", addr, "98765.stg.example.com.").await;
+        assert!(!is_zero_ip_block(&after), "revoked rule no longer blocks");
     }
 
     // ── TCP transport framing (length-prefixed, real socket) ──
