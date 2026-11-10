@@ -180,6 +180,8 @@ invalid_stale_and_unconfirmed_requests_install_nothing(Config) ->
     R0 = policy_revision(),
     Good = family_block("bad.example.com", null),
     Bad = [maps:remove(<<"confirm">>, Good),
+           maps:remove(<<"client_ip">>, Good),
+           Good#{<<"client_ip">> => <<>>},
            Good#{<<"confirm">> => false},
            Good#{<<"pattern">> => <<"{n}.something.else">>},
            Good#{<<"tld">> => <<"net">>},

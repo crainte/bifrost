@@ -14,11 +14,12 @@ campaigns() ->
 
 family_body() ->
     #{<<"kind">> => <<"family">>, <<"parent">> => <<"stg.content-loader.com">>,
-      <<"pattern">> => <<"{n}.stg.content-loader.com">>, <<"confirm">> => true}.
+      <<"pattern">> => <<"{n}.stg.content-loader.com">>, <<"client_ip">> => null,
+      <<"confirm">> => true}.
 
 marker_body() ->
     #{<<"kind">> => <<"marker">>, <<"tld">> => <<"site">>, <<"leading_label">> => <<"447">>,
-      <<"pattern">> => <<"447.*.site">>, <<"confirm">> => true}.
+      <<"pattern">> => <<"447.*.site">>, <<"client_ip">> => null, <<"confirm">> => true}.
 
 %% ── validate_block/2 ──────────────────────────────────────────
 
@@ -39,6 +40,15 @@ client_scope_is_taken_from_the_request_test() ->
     ?assertEqual({error, <<"invalid client_ip">>},
                  bifrost_threat_campaigns:validate_block(
                    (family_body())#{<<"client_ip">> => <<"not-an-ip">>}, campaigns())).
+
+omitted_or_blank_scope_must_not_become_an_all_client_block_test() ->
+    [?assertEqual({error, <<"invalid client_ip">>},
+                  bifrost_threat_campaigns:validate_block(Body, campaigns()))
+     || Body <- [maps:remove(<<"client_ip">>, family_body()),
+                 (family_body())#{<<"client_ip">> => <<>>}]],
+    ?assertMatch({ok, #{client_ip := null}},
+                 bifrost_threat_campaigns:validate_block(
+                   (family_body())#{<<"client_ip">> => null}, campaigns())).
 
 block_requires_explicit_confirmation_test() ->
     [?assertEqual({error, <<"confirmation required">>},
@@ -133,3 +143,17 @@ a_failing_node_that_is_behind_marks_the_rule_failed_test() ->
                  bifrost_campaign_policy:rule_state(5, [applied_node(5),
                      #{desired_revision => 5, applied_revision => 4, state => <<"failed">>,
                        last_error => <<"ack_timeout">>}])).
+
+stale_rust_ack_is_not_current_enforcement_test() ->
+    Applied = #{revision => 5, connection_id => old_connection},
+    ?assertEqual(5, bifrost_campaign_policy:effective_revision(Applied, old_connection)),
+    ?assertEqual(undefined, bifrost_campaign_policy:effective_revision(Applied, new_connection)),
+    ?assertEqual(undefined, bifrost_campaign_policy:effective_revision(Applied, undefined)),
+    ?assertEqual(undefined, bifrost_campaign_policy:effective_revision(undefined, old_connection)).
+
+disconnected_previously_serving_node_blocks_admission_test() ->
+    ?assertEqual({error, resolver_not_ready},
+                 bifrost_campaign_policy:admission_status(
+                   [#{state => <<"pending">>, connected => false, had_ack => true}])),
+    ?assertEqual(ok, bifrost_campaign_policy:admission_status(
+                       [#{state => <<"pending">>, connected => false, had_ack => false}])).
