@@ -72,7 +72,11 @@ status() -> gen_server:call(?MODULE, status, 1800).
 cluster_status() ->
     Durable = try mnesia:system_info(db_nodes) catch _:_ -> [] end,
     Seeds = try bifrost_cluster:seeds() catch _:_ -> [] end,
-    Nodes = lists:usort([node() | nodes() ++ Durable ++ Seeds]),
+    %% `nodes()` includes Erlang RPC/observer connections (notably the CT
+    %% runner), which are not resolvers and can never ACK this policy. Durable
+    %% Mnesia members and configured seeds are the resolver membership; keep
+    %% missing seeds in the list so a partition cannot look fully applied.
+    Nodes = lists:usort([node() | Durable ++ Seeds]),
     Results = erpc:multicall(Nodes, ?MODULE, status, [], 2000),
     [case R of
          {ok, S} when is_map(S) -> S#{node => N};

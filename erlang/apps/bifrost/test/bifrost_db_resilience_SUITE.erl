@@ -120,10 +120,16 @@ campaign_blocks_hydrate_from_postgres_before_reload_complete(_Config) ->
     Types = [maps:get(type, M) || M <- Msgs],
     ?assert(lists:member(<<"apply_campaign_blocks">>, Types)),
     ?assertEqual(<<"reload_complete">>, lists:last(Types)),
-    [Push | _] = campaign_msgs(Msgs),
+    %% Startup reconciliation may send the previous snapshot before hydration
+    %% reads Postgres. It is the LAST push, ACKed before reload_complete, that
+    %% determines the effective policy (and must include this newly saved rule).
+    Push = lists:last(campaign_msgs(Msgs)),
     ?assert(lists:any(fun(#{id := I, parent := P}) -> I =:= Id andalso P =:= <<"hyd.example.com">> end,
                       maps:get(rules, Push))),
-    ?assertMatch(#{state := <<"applied">>}, bifrost_campaign_policy:status()).
+    ?assertMatch(#{state := <<"applied">>, applied_revision := _},
+                 bifrost_campaign_policy:status()),
+    ?assertEqual(maps:get(revision, Push),
+                 maps:get(applied_revision, bifrost_campaign_policy:status())).
 
 %% "On DB outage use the last-known Mnesia snapshot": a NEW policy process (a
 %% restarted pod) with Postgres down still hydrates the same rules.
@@ -137,9 +143,12 @@ campaign_blocks_hydrate_from_snapshot_when_db_is_down(_Config) ->
     hydrate(),
     NoDb = collect(),
     ?assert(lists:member(#{type => <<"reload_complete">>}, NoDb)),
-    [Push | _] = campaign_msgs(NoDb),
+    Push = lists:last(campaign_msgs(NoDb)),
     ?assert(lists:any(fun(#{id := I}) -> I =:= Id end, maps:get(rules, Push))),
-    ?assertEqual(maps:get(revision, hd(campaign_msgs(Live))), maps:get(revision, Push)).
+    ?assertEqual(maps:get(revision, lists:last(campaign_msgs(Live))),
+                 maps:get(revision, Push)),
+    ?assertEqual(maps:get(revision, Push),
+                 maps:get(applied_revision, bifrost_campaign_policy:status())).
 
 %% Fail closed: neither Postgres nor a snapshot can say what the policy is, so an
 %% empty set must NOT be assumed. No reload_complete, node stays unready.

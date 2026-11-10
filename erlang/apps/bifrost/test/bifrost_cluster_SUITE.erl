@@ -676,6 +676,15 @@ pause_on_one_node_pauses_the_peers_rust(Config) ->
 pause_is_reapplied_when_a_peer_rehydrates(Config) ->
     [A, B] = ?config(nodes, Config),
     with_settings_servers([A, B], ?config(priv_dir, Config), fun() ->
+        %% The peer tests have no Postgres. Establish a KNOWN empty campaign
+        %% policy rather than weakening the hydration gate to assume one.
+        ok = erpc:call(A, bifrost_campaign_policy, publish,
+                       [#{revision => 0, rules => []}]),
+        ok = wait_until(fun() ->
+            {ok, #{revision := 0, rules := []}} =
+                erpc:call(B, bifrost_opconfig, snapshot, [campaign_blocks]),
+            true
+        end),
         ok = erpc:call(A, bifrost_config_server, set_protection, [false]),
         ok = wait_until(fun() ->
             {ok, #{enabled := E}} = erpc:call(B, bifrost_config_server, get_protection, []),
@@ -820,6 +829,8 @@ campaign_status_is_applied_only_after_every_node_acks(Config) ->
                 maps:get(applied_revision, erpc:call(B, bifrost_campaign_policy, status, [])) =:= 7050
             end),
             Statuses = erpc:call(A, bifrost_campaign_policy, cluster_status, []),
+            %% The CT runner is connected for erpc but is not a resolver.
+            ?assertEqual(lists:sort([A, B]), lists:sort([N || #{node := N} <- Statuses])),
             ?assertEqual(applying, bifrost_campaign_policy:rule_state(7050, Statuses)),
             FakeA = start_fake_rust(A),
             try
